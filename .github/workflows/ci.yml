@@ -1,0 +1,37 @@
+name: ROS2 Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup ROS2 Humble
+      uses: ros-tooling/setup-ros@v0.7
+      with:
+        required-ros-distributions: humble
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          ros-humble-ur \
+          ros-humble-moveit \
+          ros-humble-pcl-ros \
+          ros-humble-gazebo-ros-pkgs
+
+    - name: Build workspace
+      run: |
+        source /opt/ros/humble/setup.bash
+        mkdir -p ~/ros2_ws/src
+        cp -r . ~/ros2_ws/src/ros2_ur5_vision_grasp
+        cd ~/ros2_ws
+        rosdep install --from-paths src --ignore-src -r -y
+        colcon build --symlink-install

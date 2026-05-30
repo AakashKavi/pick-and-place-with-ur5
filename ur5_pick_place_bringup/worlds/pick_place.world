@@ -1,0 +1,125 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="pick_place_world">
+
+    <!-- Lighting -->
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- Ground plane -->
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- Table -->
+    <model name="table">
+      <static>true</static>
+      <pose>0.6 0 0 0 0 0</pose>
+      <link name="table_top">
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.8 0.8 0.05</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.4 0.2 1</ambient>
+          </material>
+        </visual>
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.8 0.8 0.05</size>
+            </box>
+          </geometry>
+        </collision>
+        <pose>0 0 0.7 0 0 0</pose>
+      </link>
+    </model>
+
+    <!-- Object 1: Red box -->
+    <model name="object_1">
+      <pose>0.55 0.1 0.755 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box><size>0.05 0.05 0.05</size></box>
+          </geometry>
+          <material><ambient>0.9 0.1 0.1 1</ambient></material>
+        </visual>
+        <collision name="collision">
+          <geometry>
+            <box><size>0.05 0.05 0.05</size></box>
+          </geometry>
+        </collision>
+        <inertial>
+          <mass>0.1</mass>
+          <inertia><ixx>0.0001</ixx><iyy>0.0001</iyy><izz>0.0001</izz></inertia>
+        </inertial>
+      </link>
+    </model>
+
+    <!-- Object 2: Blue cylinder -->
+    <model name="object_2">
+      <pose>0.65 -0.1 0.755 0 0 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.06</length></cylinder>
+          </geometry>
+          <material><ambient>0.1 0.1 0.9 1</ambient></material>
+        </visual>
+        <collision name="collision">
+          <geometry>
+            <cylinder><radius>0.025</radius><length>0.06</length></cylinder>
+          </geometry>
+        </collision>
+        <inertial>
+          <mass>0.1</mass>
+          <inertia><ixx>0.0001</ixx><iyy>0.0001</iyy><izz>0.0001</izz></inertia>
+        </inertial>
+      </link>
+    </model>
+
+    <!-- Depth camera (Intel RealSense-style, fixed above workspace) -->
+    <model name="depth_camera">
+      <static>true</static>
+      <pose>0.6 0 1.4 0 1.5708 0</pose>
+      <link name="link">
+        <visual name="visual">
+          <geometry>
+            <box><size>0.03 0.09 0.02</size></box>
+          </geometry>
+          <material><ambient>0.1 0.1 0.1 1</ambient></material>
+        </visual>
+        <sensor name="depth_camera" type="depth">
+          <update_rate>10</update_rate>
+          <camera>
+            <horizontal_fov>1.047</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>480</height>
+              <format>R_FLOAT32</format>
+            </image>
+            <clip>
+              <near>0.1</near>
+              <far>3.0</far>
+            </clip>
+          </camera>
+          <plugin name="depth_camera_plugin" filename="libgazebo_ros_camera.so">
+            <ros>
+              <remapping>~/points:=/camera/depth/points</remapping>
+              <remapping>~/image_raw:=/camera/depth/image_raw</remapping>
+              <remapping>~/camera_info:=/camera/depth/camera_info</remapping>
+            </ros>
+            <frame_name>depth_camera_link</frame_name>
+            <min_depth>0.1</min_depth>
+            <max_depth>3.0</max_depth>
+          </plugin>
+        </sensor>
+      </link>
+    </model>
+
+  </world>
+</sdf>
