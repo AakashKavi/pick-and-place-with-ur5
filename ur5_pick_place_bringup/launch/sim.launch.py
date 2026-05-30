@@ -31,44 +31,22 @@ def generate_launch_description():
     # 1. UR5e Gazebo simulation (from Universal Robots ROS2 driver)
     #    This starts Gazebo, spawns the robot, and loads ros2_control.
     # --------------------------------------------------------------------------
-    ur_sim = IncludeLaunchDescription(
+ # --------------------------------------------------------------------------
+    # 1+2. UR5e simulation + MoveIt! (combined into one launch)
+    # --------------------------------------------------------------------------
+    ur_sim_moveit = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([
-                FindPackageShare('ur_simulation_gazebo'),
+                FindPackageShare('ur_simulation_gz'),
                 'launch',
-                'ur_sim_control.launch.py'
+                'ur_sim_moveit.launch.py'
             ])
         ]),
         launch_arguments={
             'ur_type': ur_type,
-            'launch_rviz': 'false',         # We launch our own RViz below
+            'launch_rviz': 'true',
         }.items()
     )
-
-    # --------------------------------------------------------------------------
-    # 2. MoveIt! move_group
-    #    Delay slightly to ensure ros2_control is ready first.
-    # --------------------------------------------------------------------------
-    moveit = TimerAction(
-        period=5.0,
-        actions=[
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource([
-                    PathJoinSubstitution([
-                        FindPackageShare('ur_moveit_config'),
-                        'launch',
-                        'ur_moveit.launch.py'
-                    ])
-                ]),
-                launch_arguments={
-                    'ur_type': ur_type,
-                    'use_sim_time': 'true',
-                    'launch_rviz': 'true',
-                }.items()
-            )
-        ]
-    )
-
     # --------------------------------------------------------------------------
     # 3. Perception node — subscribes to /camera/depth/points,
     #    publishes detected object poses to /detected_objects
@@ -114,8 +92,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         ur_type_arg,
-        ur_sim,
-        moveit,
+        ur_sim_moveit,
         perception_node,
         manipulation_node,
     ])
