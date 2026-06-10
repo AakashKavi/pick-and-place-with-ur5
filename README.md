@@ -15,26 +15,9 @@ A ROS2 Humble project demonstrating a full perception-to-manipulation pipeline u
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Gazebo Simulation                      │
-│                                                               │
-│   ┌──────────────┐     PointCloud2      ┌─────────────────┐ │
-│   │ Depth Camera │ ─────────────────── ▶│  Perception Node │ │
-│   │  (RealSense) │  /camera/depth/points│  (C++ / PCL)    │ │
-│   └──────────────┘                      └────────┬────────┘ │
-│                                                   │           │
-│                                         PoseArray │           │
-│                                        /detected  │           │
-│                                          _objects │           │
-│                                                   ▼           │
-│   ┌──────────────┐   JointTrajectory   ┌─────────────────┐  │
-│   │   UR5e Arm   │ ◀─────────────────── │ Manipulation    │  │
-│   │  (ros2_control│                     │ Node (Python /  │  │
-│   │   + MoveIt!) │                     │   MoveIt! 2)    │  │
-│   └──────────────┘                     └─────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="architecture.png" alt="System architecture: depth camera publishes PointCloud2 to the PCL perception node, which sends detected object poses to the MoveIt 2 manipulation node commanding the UR5e" width="850"/>
+</p>
 
 ---
 
