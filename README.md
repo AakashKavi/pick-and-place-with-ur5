@@ -1,4 +1,5 @@
 # ROS2 Vision-Based Pick and Place with UR5
+![ROS2 CI](https://github.com/AakashKavi/ros2_ur5_vision_grasp/actions/workflows/ci.yml/badge.svg)
 
 A ROS2 Humble project demonstrating a full perception-to-manipulation pipeline using a simulated UR5e robot arm in Gazebo. A simulated depth camera detects objects on a table using 3D point cloud processing (PCL), and MoveIt! 2 plans and executes pick-and-place motions.
 
