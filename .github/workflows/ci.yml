@@ -1,4 +1,4 @@
-name: ROS2 Build
+name: ROS2 CI
 
 on:
   push:
@@ -11,27 +11,26 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-    - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Setup ROS2 Humble
-      uses: ros-tooling/setup-ros@v0.7
-      with:
-        required-ros-distributions: humble
+      - name: Set up ROS2 Humble
+        uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: humble
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          ros-humble-ur \
-          ros-humble-moveit \
-          ros-humble-pcl-ros \
-          ros-humble-gazebo-ros-pkgs
+      - name: Install dependencies
+        run: |
+          source /opt/ros/humble/setup.bash
+          rosdep update
+          rosdep install --from-paths . --ignore-src -r -y
 
-    - name: Build workspace
-      run: |
-        source /opt/ros/humble/setup.bash
-        mkdir -p ~/ros2_ws/src
-        cp -r . ~/ros2_ws/src/ros2_ur5_vision_grasp
-        cd ~/ros2_ws
-        rosdep install --from-paths src --ignore-src -r -y
-        colcon build --symlink-install
+      - name: Build with colcon
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build --symlink-install
+
+      - name: Run tests
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon test --return-code-on-test-failure
