@@ -2,11 +2,11 @@
 sim.launch.py
 
 Launches the full pick-and-place simulation:
-  1. Gazebo with custom world (table + objects + depth camera)
-  2. UR5e robot (via ur_simulation_gazebo)
-  3. MoveIt! 2 move_group
-  4. Perception node (object_detector)
-  5. Manipulation node (pick_place_node)
+  1. Gazebo with custom world (table + objects + depth camera) via ur_sim_control
+  2. MoveIt! 2 move_group (delayed 5s) via ur_moveit
+  3. ros_gz_bridge for depth camera point cloud
+  4. Perception node (object_detector, delayed 10s)
+  5. Manipulation node (pick_place_node, delayed 12s)
 """
 
 from launch import LaunchDescription
@@ -27,32 +27,72 @@ def generate_launch_description():
 
     ur_type = LaunchConfiguration('ur_type')
 
+    world_file = PathJoinSubstitution([
+        FindPackageShare('ur5_pick_place_bringup'),
+        'worlds',
+        'pick_place.sdf'
+    ])
+
     # --------------------------------------------------------------------------
-    # 1. UR5e Gazebo simulation (from Universal Robots ROS2 driver)
-    #    This starts Gazebo, spawns the robot, and loads ros2_control.
+    # 1. UR5e Gazebo simulation (gz-sim + ros2_control)
     # --------------------------------------------------------------------------
- # --------------------------------------------------------------------------
-    # 1+2. UR5e simulation + MoveIt! (combined into one launch)
-    # --------------------------------------------------------------------------
-    ur_sim_moveit = IncludeLaunchDescription(
+    ur_sim_control = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([
                 FindPackageShare('ur_simulation_gz'),
                 'launch',
-                'ur_sim_moveit.launch.py'
+                'ur_sim_control.launch.py'
             ])
         ]),
         launch_arguments={
             'ur_type': ur_type,
-            'launch_rviz': 'true',
+            'world_file': world_file,
         }.items()
     )
+
     # --------------------------------------------------------------------------
-    # 3. Perception node — subscribes to /camera/depth/points,
+    # 2. MoveIt! 2 (delayed 5s to let Gazebo + controllers come up)
+    # --------------------------------------------------------------------------
+    ur_moveit = TimerAction(
+        period=5.0,
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource([
+                    PathJoinSubstitution([
+                        FindPackageShare('ur_moveit_config'),
+                        'launch',
+                        'ur_moveit.launch.py'
+                    ])
+                ]),
+                launch_arguments={
+                    'ur_type': ur_type,
+                    'use_sim_time': 'true',
+                    'launch_rviz': 'true',
+                }.items()
+            )
+        ]
+    )
+
+    # --------------------------------------------------------------------------
+    # 3. ros_gz_bridge: bridge depth point cloud from gz to ROS2
+    # --------------------------------------------------------------------------
+    camera_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='camera_depth_bridge',
+        arguments=[
+            '/camera/depth/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked'
+        ],
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
+
+    # --------------------------------------------------------------------------
+    # 4. Perception node — subscribes to /camera/depth/points,
     #    publishes detected object poses to /detected_objects
     # --------------------------------------------------------------------------
     perception_node = TimerAction(
-        period=8.0,
+        period=10.0,
         actions=[
             Node(
                 package='ur5_pick_place_perception',
@@ -72,11 +112,11 @@ def generate_launch_description():
     )
 
     # --------------------------------------------------------------------------
-    # 4. Manipulation node — subscribes to /detected_objects,
+    # 5. Manipulation node — subscribes to /detected_objects,
     #    executes pick-and-place via MoveIt!
     # --------------------------------------------------------------------------
     manipulation_node = TimerAction(
-        period=10.0,
+        period=12.0,
         actions=[
             Node(
                 package='ur5_pick_place_manipulation',
@@ -92,7 +132,9 @@ def generate_launch_description():
 
     return LaunchDescription([
         ur_type_arg,
-        ur_sim_moveit,
+        ur_sim_control,
+        ur_moveit,
+        camera_bridge,
         perception_node,
         manipulation_node,
     ])
