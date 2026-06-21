@@ -149,7 +149,7 @@
     <!-- Pose: above table center, pitched down 90 deg (pi/2 rad) -->
     <model name="depth_camera">
       <static>true</static>
-      <pose>0.6 0 1.4 0 1.5708 0</pose>
+      <pose>0.6 0 1.5 0 1.5708 0</pose>
       <link name="link">
         <visual name="visual">
           <geometry>
