@@ -1,4 +1,7 @@
 # ROS2 Vision-Based Pick and Place with UR5e
+
+[![ROS2 Build](https://github.com/AakashKavi/ros2_ur5_vision_grasp/actions/workflows/ci.yml/badge.svg)](https://github.com/AakashKavi/ros2_ur5_vision_grasp/actions/workflows/ci.yml)
+
 ### Closing the loop between 3D point cloud perception and industrial arm motion planning — entirely in simulation, no custom robot configuration required.
 
 ---
