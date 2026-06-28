@@ -33,6 +33,22 @@ def generate_launch_description():
         'pick_place.sdf'
     ])
 
+    from launch_ros.actions import Node  # already imported
+
+    # Static transform: base_link_inertia -> depth_camera/link/depth_camera
+    # Camera is fixed at 0.6m forward, 1.5m up, pointing straight down
+    camera_tf = Node(
+    package='tf2_ros',
+    executable='static_transform_publisher',
+    name='camera_tf_publisher',
+    arguments=[
+        '0.6', '0', '1.5',      # x y z translation
+        '0', '1.5708', '0',      # roll pitch yaw (pointing down)
+        'base_link_inertia',     # parent frame
+        'depth_camera/link/depth_camera'  # child frame
+    ]
+    )
+
     # --------------------------------------------------------------------------
     # 1. UR5e Gazebo simulation (gz-sim + ros2_control)
     # --------------------------------------------------------------------------
@@ -102,10 +118,12 @@ def generate_launch_description():
                 parameters=[{
                     'use_sim_time': True,
                     'cluster_tolerance': 0.02,
-                    'min_cluster_size': 100,
+                    'min_cluster_size': 50,
                     'max_cluster_size': 25000,
-                    'passthrough_min_z': 0.05,
-                    'passthrough_max_z': 0.80,
+                    'passthrough_min_z': 0.55,
+                    'passthrough_max_z': 0.79,
+                    'plane_distance_threshold': 0.01,
+                    'voxel_leaf_size': 0.005,
                 }]
             )
         ]
@@ -131,6 +149,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        camera_tf,
         ur_type_arg,
         ur_sim_control,
         ur_moveit,

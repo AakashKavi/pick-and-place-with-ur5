@@ -18,12 +18,12 @@ ObjectDetectorNode::ObjectDetectorNode()
 {
   // Declare parameters with defaults
   this->declare_parameter("cluster_tolerance",      0.02);
-  this->declare_parameter("min_cluster_size",        100);
+  this->declare_parameter("min_cluster_size",        50);
   this->declare_parameter("max_cluster_size",      25000);
-  this->declare_parameter("passthrough_min_z",      0.05);
-  this->declare_parameter("passthrough_max_z",      0.80);
+  this->declare_parameter("passthrough_min_z",      0.55);
+  this->declare_parameter("passthrough_max_z",      0.79);
   this->declare_parameter("voxel_leaf_size",        0.01);
-  this->declare_parameter("plane_distance_threshold", 0.02);
+  this->declare_parameter("plane_distance_threshold", 0.01);
 
   cluster_tolerance_        = this->get_parameter("cluster_tolerance").as_double();
   min_cluster_size_         = this->get_parameter("min_cluster_size").as_int();
@@ -67,8 +67,8 @@ void ObjectDetectorNode::pointcloudCallback(
   // --- Pipeline ---
   auto downsampled  = downsample(cloud);
   auto filtered     = passthroughFilter(downsampled);
-  auto objects_only = removePlane(filtered);
-  auto clusters     = extractClusters(objects_only);
+  //auto objects_only = removePlane(filtered);
+  auto clusters     = extractClusters(filtered);
 
   // Build PoseArray from cluster centroids
   geometry_msgs::msg::PoseArray pose_array;
@@ -115,7 +115,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr ObjectDetectorNode::passthroughFilter(
 {
   pcl::PassThrough<pcl::PointXYZ> pass;
   pass.setInputCloud(cloud);
-  pass.setFilterFieldName("z");
+  pass.setFilterFieldName("x");
   pass.setFilterLimits(passthrough_min_z_, passthrough_max_z_);
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>);
