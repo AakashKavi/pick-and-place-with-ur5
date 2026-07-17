@@ -119,22 +119,47 @@ ros2 topic echo /detected_objects
 
 ## Package Structure
 
+```mermaid
+flowchart TD
+    subgraph BRINGUP["📦 ur5_pick_place_bringup"]
+        direction TB
+        SIM["sim.launch.py<br/><i>Gazebo + UR5e + gripper + MoveIt 2</i>"]
+        PICKPLACE["pick_place.launch.py<br/><i>perception + manipulation</i>"]
+        WORLD["pick_place.sdf<br/><i>table + cube + cylinder + camera</i>"]
+    end
+
+    subgraph DESC["📦 ur5_pick_place_description"]
+        GRIPPERXACRO["gripper.xacro<br/><i>mock parallel-jaw gripper</i>"]
+    end
+
+    subgraph MOVEITCFG["📦 ur5_pick_place_moveit_config"]
+        SRDF["ur5e_gripper.srdf.xacro<br/><i>planning tip = gripper_tcp</i>"]
+    end
+
+    subgraph PERCEPTION["📦 ur5_pick_place_perception  (C++)"]
+        DETECTOR["object_detector.cpp<br/><i>4-stage PCL pipeline</i>"]
+    end
+
+    subgraph MANIP["📦 ur5_pick_place_manipulation  (Python)"]
+        PPNODE["pick_place_node.py<br/><i>8-step pick + place</i>"]
+    end
+
+    SIM -->|spawns robot with| GRIPPERXACRO
+    SIM -->|loads| SRDF
+    SIM -->|loads| WORLD
+    PICKPLACE --> DETECTOR
+    PICKPLACE --> PPNODE
+    DETECTOR -->|/detected_objects| PPNODE
+    PPNODE -->|/gripper_position_cmd| GRIPPERXACRO
 ```
-ros2_ur5_vision_grasp/
-├── ur5_pick_place_bringup/           # Launch files, Gazebo world, config
-│   ├── launch/sim.launch.py          # Simulation only: Gazebo + UR5e + gripper + MoveIt 2
-│   ├── launch/pick_place.launch.py   # Perception + manipulation, run against a live sim
-│   ├── worlds/pick_place.sdf         # SDF 1.9 world: table + cube + cylinder + camera
-│   └── config/ur5e_gripper_controllers.yaml
-├── ur5_pick_place_description/       # UR5e + gripper xacro (overlay on ur_description)
-│   └── urdf/gripper.xacro            # Mock parallel-jaw gripper + gz JointPositionController
-├── ur5_pick_place_moveit_config/     # Custom SRDF (gripper_tcp as the planning tip) + kinematics
-├── ur5_pick_place_perception/        # C++ PCL object detection node
-│   ├── include/.../object_detector.hpp
-│   └── src/object_detector.cpp       # 4-stage PCL pipeline
-└── ur5_pick_place_manipulation/      # Python MoveIt 2 pick-and-place sequence
-    └── .../pick_place_node.py        # 8-step pick-cylinder-place-on-cube execution
-```
+
+| Package | Purpose |
+|---|---|
+| `ur5_pick_place_bringup` | Launch files, Gazebo world, gripper controller config |
+| `ur5_pick_place_description` | UR5e + gripper xacro (overlay on `ur_description`) |
+| `ur5_pick_place_moveit_config` | Custom SRDF + kinematics for the gripper-equipped arm |
+| `ur5_pick_place_perception` | C++ PCL object detection node |
+| `ur5_pick_place_manipulation` | Python MoveIt 2 pick-and-place execution node |
 
 ---
 
