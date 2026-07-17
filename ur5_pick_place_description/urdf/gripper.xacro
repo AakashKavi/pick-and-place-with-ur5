@@ -1,0 +1,134 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://wiki.ros.org/xacro">
+
+  <!--
+    Simple mock single-jaw parallel gripper.
+
+    One fixed finger and one prismatic "moving_finger" slide along the local
+    Y axis of gripper_base. gripper_tcp is a massless frame centered between
+    the two fingertips at full open — MoveIt plans to this frame (not tool0)
+    so the fingertips, not the flange, arrive at the grasp target.
+  -->
+  <xacro:macro name="mock_gripper" params="parent prefix:=''">
+
+    <joint name="${prefix}gripper_base_joint" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${prefix}gripper_base"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}gripper_base">
+      <visual>
+        <origin xyz="0 0 0.015" rpy="0 0 0"/>
+        <geometry><box size="0.04 0.10 0.03"/></geometry>
+        <material name="gripper_grey"><color rgba="0.2 0.2 0.2 1"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0.015" rpy="0 0 0"/>
+        <geometry><box size="0.04 0.10 0.03"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="0.2"/>
+        <origin xyz="0 0 0.015" rpy="0 0 0"/>
+        <inertia ixx="0.0001" iyy="0.0001" izz="0.0001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+    </link>
+
+    <joint name="${prefix}fixed_finger_joint" type="fixed">
+      <parent link="${prefix}gripper_base"/>
+      <child link="${prefix}fixed_finger"/>
+      <origin xyz="0 -0.041 0.06" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}fixed_finger">
+      <visual>
+        <geometry><box size="0.012 0.012 0.05"/></geometry>
+        <material name="gripper_grey"/>
+      </visual>
+      <collision>
+        <geometry><box size="0.012 0.012 0.05"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="0.02"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <inertia ixx="0.00001" iyy="0.00001" izz="0.00001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+    </link>
+
+    <joint name="${prefix}gripper_finger_joint" type="prismatic">
+      <parent link="${prefix}gripper_base"/>
+      <child link="${prefix}moving_finger"/>
+      <origin xyz="0 0.041 0.06" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <!-- Jaw gap = 2 * (0.041 - 0.006 finger half-width) + joint offset.
+           0.0 = fully open, ~7cm gap (clears the 5cm cube/cylinder with
+           margin during approach). -0.018 = closed, ~5.2cm gap (snug
+           around a 5cm object without visually clipping through it). -->
+      <limit lower="-0.018" upper="0.0" effort="20.0" velocity="0.5"/>
+      <dynamics damping="0.1" friction="0.02"/>
+    </joint>
+
+    <link name="${prefix}moving_finger">
+      <visual>
+        <geometry><box size="0.012 0.012 0.05"/></geometry>
+        <material name="gripper_grey"/>
+      </visual>
+      <collision>
+        <geometry><box size="0.012 0.012 0.05"/></geometry>
+      </collision>
+      <inertial>
+        <mass value="0.02"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <inertia ixx="0.00001" iyy="0.00001" izz="0.00001" ixy="0" ixz="0" iyz="0"/>
+      </inertial>
+    </link>
+
+    <!-- Grasp target frame: centered between the fingertips -->
+    <joint name="${prefix}gripper_tcp_joint" type="fixed">
+      <parent link="${prefix}gripper_base"/>
+      <child link="${prefix}gripper_tcp"/>
+      <origin xyz="0 0 0.085" rpy="0 0 0"/>
+    </joint>
+
+    <link name="${prefix}gripper_tcp"/>
+
+    <!--
+      Driven directly by a gz-sim JointPositionController system plugin
+      instead of a ros2_control command interface (simpler and proven to
+      reliably move the joint; the built-in gz plugin is bridged to ROS2
+      via ros_gz_bridge, see sim.launch.py).
+    -->
+    <gazebo>
+      <plugin filename="gz-sim-joint-position-controller-system"
+              name="gz::sim::systems::JointPositionController">
+        <joint_name>${prefix}gripper_finger_joint</joint_name>
+        <topic>gripper_position_cmd</topic>
+        <p_gain>200</p_gain>
+        <i_gain>0</i_gain>
+        <d_gain>5</d_gain>
+        <i_max>1</i_max>
+        <i_min>-1</i_min>
+        <cmd_max>50</cmd_max>
+        <cmd_min>-50</cmd_min>
+      </plugin>
+    </gazebo>
+
+    <!--
+      State-only ros2_control interface (no command_interface) purely so
+      joint_state_broadcaster publishes gripper_finger_joint on
+      /joint_states. Without this MoveIt's planning scene monitor never
+      considers the robot state "complete" and silently stalls delivering
+      MoveGroup action results.
+    -->
+    <ros2_control name="${prefix}GripperState" type="system">
+      <hardware>
+        <plugin>ign_ros2_control/IgnitionSystem</plugin>
+      </hardware>
+      <joint name="${prefix}gripper_finger_joint">
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+      </joint>
+    </ros2_control>
+
+  </xacro:macro>
+</robot>

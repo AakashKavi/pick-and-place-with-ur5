@@ -1,12 +1,14 @@
 """
 sim.launch.py
 
-Launches the full pick-and-place simulation:
+Launches only the simulation (no perception/manipulation):
   1. Gazebo with custom world (table + objects + depth camera) via ur_sim_control
   2. MoveIt! 2 move_group (delayed 5s) via ur_moveit
   3. ros_gz_bridge for depth camera point cloud
-  4. Perception node (object_detector, delayed 10s)
-  5. Manipulation node (pick_place_node, delayed 12s)
+  4. ros_gz_bridge for the gripper position command topic
+
+Once this is up and MoveIt is connected, run pick_place.launch.py separately
+to start perception + the pick-and-place manipulation node.
 """
 
 from launch import LaunchDescription
@@ -33,18 +35,22 @@ def generate_launch_description():
         'pick_place.sdf'
     ])
 
-    from launch_ros.actions import Node  # already imported
-
-    # Static transform: base_link_inertia -> depth_camera/link/depth_camera
-    # Camera is fixed at 0.6m forward, 1.5m up, pointing straight down
+    # Static transform: base_link -> depth_camera/link/depth_camera
+    # Camera is fixed at 0.65m forward, 1.3m up, pointing straight down —
+    # must match the depth_camera model's pose in pick_place.sdf exactly.
+    # Parented to base_link (not base_link_inertia): base_link is coincident
+    # with world (identity fixed joint in ur.urdf.xacro), matching the
+    # camera's actual world-frame pose in pick_place.sdf.
+    # base_link_inertia is base_link rotated 180deg about Z, which would
+    # place this TF frame on the wrong side of the robot.
     camera_tf = Node(
     package='tf2_ros',
     executable='static_transform_publisher',
     name='camera_tf_publisher',
     arguments=[
-        '0.6', '0', '1.5',      # x y z translation
+        '0.65', '0', '1.3',      # x y z translation
         '0', '1.5708', '0',      # roll pitch yaw (pointing down)
-        'base_link_inertia',     # parent frame
+        'base_link',              # parent frame
         'depth_camera/link/depth_camera'  # child frame
     ]
     )
@@ -63,7 +69,27 @@ def generate_launch_description():
         launch_arguments={
             'ur_type': ur_type,
             'world_file': world_file,
+            'description_package': 'ur5_pick_place_description',
+            'description_file': 'ur5e_gripper.urdf.xacro',
+            'runtime_config_package': 'ur5_pick_place_bringup',
+            'controllers_file': 'ur5e_gripper_controllers.yaml',
         }.items()
+    )
+
+    # --------------------------------------------------------------------------
+    # Gripper bridge: the gripper's prismatic joint is driven directly by a
+    # gz-sim JointPositionController plugin (see gripper.xacro) rather than
+    # ros2_control, so it just needs a ROS2 -> Gazebo topic bridge.
+    # --------------------------------------------------------------------------
+    gripper_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='gripper_position_bridge',
+        arguments=[
+            '/gripper_position_cmd@std_msgs/msg/Float64]gz.msgs.Double'
+        ],
+        output='screen',
+        parameters=[{'use_sim_time': True}]
     )
 
     # --------------------------------------------------------------------------
@@ -84,6 +110,10 @@ def generate_launch_description():
                     'ur_type': ur_type,
                     'use_sim_time': 'true',
                     'launch_rviz': 'true',
+                    'description_package': 'ur5_pick_place_description',
+                    'description_file': 'ur5e_gripper.urdf.xacro',
+                    'moveit_config_package': 'ur5_pick_place_moveit_config',
+                    'moveit_config_file': 'ur5e_gripper.srdf.xacro',
                 }.items()
             )
         ]
@@ -103,57 +133,11 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}]
     )
 
-    # --------------------------------------------------------------------------
-    # 4. Perception node — subscribes to /camera/depth/points,
-    #    publishes detected object poses to /detected_objects
-    # --------------------------------------------------------------------------
-    perception_node = TimerAction(
-        period=10.0,
-        actions=[
-            Node(
-                package='ur5_pick_place_perception',
-                executable='object_detector',
-                name='object_detector',
-                output='screen',
-                parameters=[{
-                    'use_sim_time': True,
-                    'cluster_tolerance': 0.02,
-                    'min_cluster_size': 50,
-                    'max_cluster_size': 25000,
-                    'passthrough_min_z': 0.55,
-                    'passthrough_max_z': 0.79,
-                    'plane_distance_threshold': 0.01,
-                    'voxel_leaf_size': 0.005,
-                }]
-            )
-        ]
-    )
-
-    # --------------------------------------------------------------------------
-    # 5. Manipulation node — subscribes to /detected_objects,
-    #    executes pick-and-place via MoveIt!
-    # --------------------------------------------------------------------------
-    manipulation_node = TimerAction(
-        period=12.0,
-        actions=[
-            Node(
-                package='ur5_pick_place_manipulation',
-                executable='pick_place_node',
-                name='pick_place_node',
-                output='screen',
-                parameters=[{
-                    'use_sim_time': True,
-                }]
-            )
-        ]
-    )
-
     return LaunchDescription([
         camera_tf,
         ur_type_arg,
         ur_sim_control,
         ur_moveit,
         camera_bridge,
-        perception_node,
-        manipulation_node,
+        gripper_bridge,
     ])

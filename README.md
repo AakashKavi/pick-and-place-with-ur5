@@ -8,11 +8,11 @@
 
 ##  Project Overview
 
-Standard pick-and-place tutorials either skip perception entirely (hardcoded object positions) or skip manipulation (just detect, never act). This project builds the full pipeline: a depth camera sees objects on a table, a PCL-based perception node detects them, and MoveIt 2 commands a UR5e arm to pick them up.
+Standard pick-and-place tutorials either skip perception entirely (hardcoded object positions) or skip manipulation (just detect, never act). This project builds the full pipeline: a depth camera sees objects on a table, a PCL-based perception node detects them, and MoveIt 2 commands a UR5e arm — fitted with a custom parallel-jaw gripper — to pick one up and place it on another.
 
-The simulation runs on ROS2 Humble with the new Gazebo (gz-sim), using the official Universal Robots ROS2 driver — no custom URDF or robot configuration needed, just the application layer on top.
+The simulation runs on ROS2 Humble with the new Gazebo (gz-sim), using the official Universal Robots ROS2 driver as the base — the arm and controllers are stock, with a custom gripper and MoveIt config layered on top.
 
-**Current status:** Simulation running, MoveIt 2 connected, depth camera bridge active. Object detection and pick execution in progress (Part 2).
+**Current status:** Full pipeline working end-to-end — perception detects the objects, MoveIt 2 plans collision-aware motions around a registered table, the gripper picks up the cylinder and places it on top of the cube.
 
 ---
 
@@ -26,11 +26,16 @@ The simulation runs on ROS2 Humble with the new Gazebo (gz-sim), using the offic
 
 ##  Key Features
 
-* **Full perception-to-manipulation pipeline** — depth camera → PCL clustering → MoveIt 2 pick sequence, all connected over ROS2 topics
+* **Full perception-to-manipulation pipeline** — depth camera → PCL clustering → MoveIt 2 pick-and-place sequence, all connected over ROS2 topics
+* **Custom mock parallel-jaw gripper** — added on top of the stock UR5e, driven directly by a gz-sim `JointPositionController` plugin, sized to actually fit around the scene's objects
+* **Pick-and-place, not just pick** — identifies the cylinder vs. the cube (via nearest-match against ground truth, since perception doesn't classify shape), picks the cylinder up and stacks it on the cube
+* **Collision-aware planning** — the table is registered with MoveIt as a real `CollisionObject`, so motions are actually planned around it instead of just being statically unlikely to hit it
+* **Mixed trajectory types per motion** — long transit moves use a cubic-spline joint trajectory (smooth single accelerate/decelerate blend, collision-checked per waypoint); short local moves (descend/retreat to grasp or place) use Cartesian linear interpolation so the end effector travels a straight line instead of an arbitrary joint-space path
+* **Grasp verification + retry** — after closing the gripper, checks the object's actual Gazebo pose against the gripper's actual pose (not just the planned target) before declaring success; retries the whole approach up to 3 times if the grasp missed
+* **Kinematic attach** — since the gripper doesn't grip via contact physics, a held object's Gazebo pose is teleported to track the gripper between waypoints
 * **New Gazebo (gz-sim) compatible** — world file written in SDF 1.9 with gz-sim system plugins, not Gazebo Classic syntax
-* **ros_gz_bridge integration** — explicit bridge node translates `gz.msgs.PointCloudPacked` into ROS2 `sensor_msgs/PointCloud2`
+* **ros_gz_bridge integration** — explicit bridge nodes translate `gz.msgs.PointCloudPacked` and the gripper command topic between ROS2 and Gazebo
 * **C++ PCL perception node** — four-stage pipeline: voxel grid downsampling → passthrough filter → RANSAC plane removal → Euclidean cluster extraction
-* **Python MoveIt 2 manipulation node** — five-step pick sequence: pre-grasp → descend → grasp → retreat → home
 * **RViz marker visualization** — detected object centroids published as `visualization_msgs/MarkerArray` for real-time inspection
 * **GitHub Actions CI** — automated build check on every push
 
@@ -50,7 +55,8 @@ sudo apt install \
   ros-humble-moveit \
   ros-humble-pcl-ros \
   ros-humble-ros-gz-bridge \
-  ros-humble-gazebo-ros-pkgs
+  ros-humble-gazebo-ros-pkgs \
+  python3-scipy
 ```
 
 ---
@@ -76,17 +82,27 @@ source install/setup.bash
 
 ##  Usage
 
+Simulation and the pick-and-place operation are launched separately.
+
 ```bash
-# Launch full simulation: Gazebo + UR5e + MoveIt 2 + perception + manipulation
+# 1. Launch the simulation: Gazebo + UR5e + gripper + MoveIt 2
 ros2 launch ur5_pick_place_bringup sim.launch.py
 ```
 
-The launch sequence:
+Launch sequence:
 1. Gazebo starts with the custom world (table, objects, depth camera)
 2. MoveIt 2 move_group connects (5s delay)
-3. Camera bridge starts publishing `/camera/depth/points`
-4. Perception node starts processing point clouds (10s delay)
-5. Manipulation node starts listening for detected objects (12s delay)
+3. Camera and gripper command bridges start
+
+Wait for RViz/MoveIt to finish connecting, then in a second terminal:
+
+```bash
+# 2. Start perception + the pick-and-place manipulation node
+ros2 launch ur5_pick_place_bringup pick_place.launch.py
+```
+
+This starts the perception node (publishing `/detected_objects`) and the
+manipulation node, which picks up the cylinder and places it on the cube.
 
 To verify the camera bridge is active:
 ```bash
@@ -105,14 +121,19 @@ ros2 topic echo /detected_objects
 
 ```
 ros2_ur5_vision_grasp/
-├── ur5_pick_place_bringup/         # Launch files, Gazebo world, config
-│   ├── launch/sim.launch.py        # Master launch file
-│   └── worlds/pick_place.sdf       # SDF 1.9 world: table + objects + camera
-├── ur5_pick_place_perception/      # C++ PCL object detection node
+├── ur5_pick_place_bringup/           # Launch files, Gazebo world, config
+│   ├── launch/sim.launch.py          # Simulation only: Gazebo + UR5e + gripper + MoveIt 2
+│   ├── launch/pick_place.launch.py   # Perception + manipulation, run against a live sim
+│   ├── worlds/pick_place.sdf         # SDF 1.9 world: table + cube + cylinder + camera
+│   └── config/ur5e_gripper_controllers.yaml
+├── ur5_pick_place_description/       # UR5e + gripper xacro (overlay on ur_description)
+│   └── urdf/gripper.xacro            # Mock parallel-jaw gripper + gz JointPositionController
+├── ur5_pick_place_moveit_config/     # Custom SRDF (gripper_tcp as the planning tip) + kinematics
+├── ur5_pick_place_perception/        # C++ PCL object detection node
 │   ├── include/.../object_detector.hpp
-│   └── src/object_detector.cpp     # 4-stage PCL pipeline
-└── ur5_pick_place_manipulation/    # Python MoveIt 2 pick sequence
-    └── .../pick_place_node.py      # 5-step pick execution
+│   └── src/object_detector.cpp       # 4-stage PCL pipeline
+└── ur5_pick_place_manipulation/      # Python MoveIt 2 pick-and-place sequence
+    └── .../pick_place_node.py        # 8-step pick-cylinder-place-on-cube execution
 ```
 
 ---
@@ -139,6 +160,7 @@ The fix required three changes:
 | `/camera/depth/points` | `sensor_msgs/PointCloud2` | Camera → Perception |
 | `/detected_objects` | `geometry_msgs/PoseArray` | Perception → Manipulation |
 | `/detected_objects_markers` | `visualization_msgs/MarkerArray` | Perception → RViz |
+| `/gripper_position_cmd` | `std_msgs/Float64` | Manipulation → Gripper (gz `JointPositionController`) |
 
 ---
 
@@ -146,9 +168,10 @@ The fix required three changes:
 
 * Fix ogre2 depth camera rendering to produce valid (non-NaN) point cloud values in headless Gazebo
 * Replace centroid heuristic with learned grasp pose estimation (GraspNet or similar)
-* Add gripper state feedback using a simulated force/torque sensor
-* Implement multi-object sequencing (pick all objects in order)
+* Add gripper state feedback using a simulated force/torque sensor, and grip via real contact physics instead of kinematic attach
+* Implement multi-object sequencing (pick and place all objects in order)
 * Add eye-in-hand camera configuration as an alternative to fixed overhead mount
+* Publish planned trajectories to RViz's `MotionPlanning` display for visualization
 
 ---
 
