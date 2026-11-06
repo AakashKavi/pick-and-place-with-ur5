@@ -49,19 +49,22 @@ groups:
     from the executor's pool.
   - _joint_state_group (ReentrantCallbackGroup): owns only the
     /joint_states subscription, separately from _client_group. First
-    version of this change put /joint_states in _client_group too, and
-    testing against the real simulator (not just reasoning about it) showed
-    that was wrong: under sustained action/service traffic, every thread
-    could end up busy processing _client_group callbacks back to back, and
-    /joint_states callbacks — competing for the same pool, with no
-    priority over anything else — lost out indefinitely. The node spun for
-    the full 420s test timeout always reporting "No current joint state
-    yet", never once having received a single /joint_states message, which
-    cascaded into every spline move falling back to the slower,
-    collision-checked joint-space planner and that in turn timing out
-    (MoveIt error -4) under planning_time pressure. Giving /joint_states
-    its own group means it is never waiting behind action/service work for
-    a thread.
+    version of this change put /joint_states in _client_group too. A test
+    run against the real simulator then showed every spline move falling
+    back to the slower, collision-checked joint-space planner and timing
+    out (MoveIt error -4), with the node reporting "No current joint state
+    yet" throughout. At the time this looked like thread starvation under
+    sustained action/service traffic, and this separate group plus raising
+    num_threads from 4 to 8 was the fix made for it. A later, genuinely
+    clean rerun (nothing else competing for CPU) completed normally with
+    none of those symptoms, which pointed at the real cause instead: three
+    earlier test runs had each left an orphaned Gazebo instance running
+    (a bug in the test script's own cleanup, not in this node), and the
+    failing run had been sharing the machine with all of them. The
+    starvation explanation was never actually confirmed, only guessed at
+    before the real cause was found. This separate group and num_threads=8
+    are kept anyway as a reasonable defensive choice, not because they were
+    shown to be necessary. Full account in DECISIONS.md.
 
 Because the sequence now runs on its own executor thread (from
 _sequence_group) and the action/service results are delivered by other
@@ -266,15 +269,16 @@ class PickPlaceNode(Node):
         super().__init__("pick_place_node")
 
         # ------------------------------------------------------------------
-        # Callback groups — see the threading model comment at the top of
-        # this file. _sequence_group serializes the pick-and-place sequence
-        # (one callback, mutually exclusive with itself); _client_group lets
-        # every action/service client be serviced concurrently, on other
+        # Callback groups, see the threading model comment at the top of
+        # this file. _sequence_group serializes the pick and place sequence
+        # (one callback, mutually exclusive with itself). _client_group lets
+        # every action and service client be serviced concurrently, on other
         # executor threads, while the sequence callback is blocked waiting
-        # on one of them; _joint_state_group is separate from _client_group
-        # so /joint_states is never starved by action/service traffic
-        # (confirmed against the real simulator that sharing one group for
-        # both was not safe, see the top-of-file comment).
+        # on one of them. _joint_state_group is separate from _client_group
+        # as a defensive choice, kept apart so /joint_states is never
+        # waiting behind action/service traffic for a thread, even though
+        # that was never actually shown to be necessary, see the
+        # top-of-file comment and DECISIONS.md for the full story.
         # ------------------------------------------------------------------
         self._sequence_group = MutuallyExclusiveCallbackGroup()
         self._client_group = ReentrantCallbackGroup()
@@ -1257,14 +1261,16 @@ def main(args=None):
     # how many threads are available), one is effectively reserved for
     # /joint_states (_joint_state_group is otherwise empty), the rest
     # service _client_group (action/service results) concurrently while the
-    # sequence is blocked. 4 threads total was tried first and was not
-    # enough: under sustained action/service load every thread ended up
-    # busy with _client_group work and /joint_states starved for the full
-    # length of a test run (see the threading model comment at the top of
-    # this file for what that looked like). This node is I/O-bound, not
-    # CPU-bound — almost every thread spends nearly all its time blocked on
-    # a future or a sleep, not computing — so more threads than this
-    # machine's 8 cores is still reasonable headroom, not wasted resources.
+    # sequence is blocked. 4 threads was tried first and a test run against
+    # it failed with symptoms that looked like thread starvation, which is
+    # why this was raised to 8; a later clean rerun with nothing else
+    # competing for CPU found the real cause was an unrelated test script
+    # bug (orphaned Gazebo processes, see DECISIONS.md), not insufficient
+    # threads. 8 is kept as a reasonable defensive choice, not because 4
+    # was shown to be insufficient. This node is I/O-bound, not CPU-bound,
+    # almost every thread spends nearly all its time blocked on a future or
+    # a sleep, not computing, so more threads than this machine's 8 cores
+    # is still reasonable headroom, not wasted resources.
     executor = MultiThreadedExecutor(num_threads=8)
     executor.add_node(node)
     try:
