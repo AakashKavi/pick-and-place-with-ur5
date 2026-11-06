@@ -153,6 +153,51 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}]
     )
 
+    # --------------------------------------------------------------------------
+    # 5. ros_gz_bridge: ground-truth model poses, read + write, for
+    # pick_place_node.py. Replaces the "ign model -p" / "ign service
+    # set_pose" subprocess CLI calls that version used to shell out to.
+    #
+    # Read side: gz-sim's own dynamic_pose/info topic (ignition.msgs.Pose_V,
+    # one entry per non-static entity, keyed by bare entity name in
+    # child_frame_id, confirmed live: "ros2 topic echo
+    # /world/pick_place_world/dynamic_pose/info" showed child_frame_id:
+    # blue_cylinder / red_box with the expected spawn coordinates) bridges
+    # cleanly to tf2_msgs/msg/TFMessage; ros_gz_bridge has that conversion
+    # built in (confirmed in its compiled symbol table before relying on
+    # it: FactoryI<tf2_msgs::msg::TFMessage, ignition::msgs::Pose_V>).
+    #
+    # Write side: gz-sim's /world/<world>/set_pose service bridges cleanly
+    # to ros_gz_interfaces/srv/SetEntityPose (also confirmed in the
+    # compiled symbol table, then verified live: calling it on
+    # blue_cylinder and reading its pose back immediately after showed the
+    # teleport actually happened, including the object subsequently
+    # falling under gravity exactly as a real teleport-then-physics-steps
+    # would produce). No subprocess fallback was needed for either
+    # direction.
+    # --------------------------------------------------------------------------
+    world_pose_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='world_pose_bridge',
+        arguments=[
+            '/world/pick_place_world/dynamic_pose/info@tf2_msgs/msg/TFMessage[ignition.msgs.Pose_V'
+        ],
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
+
+    world_set_pose_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='world_set_pose_bridge',
+        arguments=[
+            '/world/pick_place_world/set_pose@ros_gz_interfaces/srv/SetEntityPose'
+        ],
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
+
     return LaunchDescription([
         ur_type_arg,
         camera_x_arg,
@@ -166,4 +211,6 @@ def generate_launch_description():
         ur_moveit,
         camera_bridge,
         gripper_bridge,
+        world_pose_bridge,
+        world_set_pose_bridge,
     ])

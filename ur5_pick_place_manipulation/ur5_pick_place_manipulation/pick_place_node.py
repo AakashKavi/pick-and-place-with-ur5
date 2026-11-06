@@ -97,9 +97,12 @@ from moveit_msgs.msg import (
     RobotTrajectory,
 )
 from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetStateValidity
+from ros_gz_interfaces.msg import Entity
+from ros_gz_interfaces.srv import SetEntityPose
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Float64
+from tf2_msgs.msg import TFMessage
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 import tf2_ros
@@ -109,7 +112,6 @@ from scipy.interpolate import CubicSpline
 
 import copy
 import math
-import subprocess
 import threading
 import time
 
@@ -206,7 +208,10 @@ MIN_VALIDITY_CHECKS = 5          # floor so a tiny move still gets checked
 # limits these correspond to)
 GRIPPER_OPEN      = 0.0
 GRIPPER_CLOSED    = -0.018
-GRIPPER_MOVE_TIME = 0.5   # seconds given to the gz JointPositionController to get there
+GRIPPER_JOINT_NAME = "gripper_finger_joint"
+GRIPPER_POSITION_TOLERANCE = 0.001   # metres
+GRIPPER_WAIT_TIMEOUT = 2.0            # seconds before giving up and continuing anyway
+GRIPPER_WAIT_POLL_INTERVAL = 0.02     # seconds
 
 # Kinematic-attach bookkeeping.
 GZ_WORLD_NAME       = "pick_place_world"
@@ -335,6 +340,23 @@ class PickPlaceNode(Node):
         self._planning_scene_client.wait_for_service()
 
         # ------------------------------------------------------------------
+        # Ground-truth model poses: read via the dynamic_pose/info ->
+        # TFMessage bridge (sim.launch.py), write via the set_pose ->
+        # SetEntityPose bridge. See _get_model_pose / _set_model_pose and
+        # sim.launch.py's world_pose_bridge / world_set_pose_bridge
+        # comments for how these were chosen and verified.
+        # ------------------------------------------------------------------
+        self._latest_world_poses = {}   # name (str) -> (x, y, z)
+        self.create_subscription(
+            TFMessage, f"/world/{GZ_WORLD_NAME}/dynamic_pose/info", self._world_pose_cb, 10,
+            callback_group=self._client_group)
+
+        self._set_pose_client = self.create_client(
+            SetEntityPose, f"/world/{GZ_WORLD_NAME}/set_pose", callback_group=self._client_group)
+        self.get_logger().info("Waiting for /world/.../set_pose service...")
+        self._set_pose_client.wait_for_service()
+
+        # ------------------------------------------------------------------
         # Gripper command publisher (drives the gz-sim JointPositionController
         # plugin on gripper_finger_joint directly, see gripper.xacro)
         # ------------------------------------------------------------------
@@ -343,6 +365,15 @@ class PickPlaceNode(Node):
 
         # Name of the Gazebo model currently held via kinematic attach, if any
         self._attached_model = None
+
+        # dynamic_pose/info is only published periodically, not retrieved
+        # on demand the way the old subprocess call was, so this node has
+        # to actually receive at least one message before it knows any
+        # model's pose — needed next, for the collision objects below.
+        # Same pre-spin reasoning as the rclpy.spin_until_future_complete
+        # calls elsewhere in this constructor: there is no running spin
+        # loop yet for this to nest inside of.
+        self._wait_for_initial_world_poses()
 
         # ------------------------------------------------------------------
         # Planning scene: register the table, cube, and cylinder so MoveIt
@@ -693,54 +724,75 @@ class PickPlaceNode(Node):
     # -----------------------------------------------------------------------
     def _send_gripper_command(self, position: float) -> None:
         self._gripper_pub.publish(Float64(data=position))
-        # gz's JointPositionController drives the joint asynchronously with
-        # no completion feedback over this topic; give it time to get there.
-        time.sleep(GRIPPER_MOVE_TIME)
+        # The gz JointPositionController drives the joint asynchronously
+        # with no completion feedback over the /gripper_position_cmd topic
+        # itself, but its actual progress is observable: gripper.xacro adds
+        # a state-only ros2_control interface specifically so
+        # gripper_finger_joint is published on /joint_states (see its
+        # comment), which this node already subscribes to
+        # (_joint_state_cb). Poll that instead of sleeping a fixed amount
+        # regardless of whether the joint actually got there yet.
+        deadline = time.monotonic() + GRIPPER_WAIT_TIMEOUT
+        while time.monotonic() < deadline:
+            joint_state = self._latest_joint_state
+            if joint_state is not None and GRIPPER_JOINT_NAME in joint_state.name:
+                idx = joint_state.name.index(GRIPPER_JOINT_NAME)
+                if abs(joint_state.position[idx] - position) <= GRIPPER_POSITION_TOLERANCE:
+                    return
+            time.sleep(GRIPPER_WAIT_POLL_INTERVAL)
+        self.get_logger().warn(
+            f"Gripper did not reach {position:.4f} within {GRIPPER_WAIT_TIMEOUT}s; "
+            "continuing anyway."
+        )
 
     # -----------------------------------------------------------------------
     # Kinematic attach — the mock gripper does not grip objects through
     # contact physics, so while an object is "held" we teleport it in Gazebo
     # to track the gripper_tcp frame instead.
+    #
+    # Ground-truth model poses used to be read with "ign model -m <name> -p"
+    # and written with "ign service ... set_pose", both as a blocking
+    # subprocess shelling out to the ign CLI. Both are now plain ROS2
+    # topic/service calls instead, bridged in sim.launch.py (see its
+    # world_pose_bridge / world_set_pose_bridge comments for how this was
+    # found and verified against the real simulator before relying on it):
+    #   - read: gz-sim's dynamic_pose/info -> tf2_msgs/msg/TFMessage,
+    #     subscribed below and cached by name in _latest_world_poses.
+    #   - write: gz-sim's set_pose service -> ros_gz_interfaces/srv/
+    #     SetEntityPose, called through _set_pose_client.
     # -----------------------------------------------------------------------
-    def _get_model_pose(self, name: str):
-        # NOTE: this must be the "ign" CLI, not "gz" — in this Fortress-era
-        # install "gz model" can't find the running server at all ("An
-        # instance of Gazebo is not running"), while "ign model" is the one
-        # that actually talks to it.
-        try:
-            out = subprocess.run(
-                ["ign", "model", "-m", name, "-p"],
-                capture_output=True, text=True, timeout=3.0,
+    def _world_pose_cb(self, msg: TFMessage) -> None:
+        for t in msg.transforms:
+            translation = t.transform.translation
+            self._latest_world_poses[t.child_frame_id] = (
+                translation.x, translation.y, translation.z)
+
+    def _wait_for_initial_world_poses(self, timeout_sec: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline and not self._latest_world_poses:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if not self._latest_world_poses:
+            self.get_logger().warn(
+                f"No model poses received within {timeout_sec}s of starting "
+                "to listen; the scene collision objects below may be skipped."
             )
-        except (subprocess.SubprocessError, OSError):
-            return None
-        lines = out.stdout.splitlines()
-        for i, line in enumerate(lines):
-            if "Pose [" in line and i + 1 < len(lines):
-                nums = lines[i + 1].strip().strip("[]").split()
-                if len(nums) >= 3:
-                    try:
-                        return tuple(float(n) for n in nums[:3])
-                    except ValueError:
-                        return None
-        return None
+
+    def _get_model_pose(self, name: str):
+        return self._latest_world_poses.get(name)
 
     def _set_model_pose(self, name: str, x: float, y: float, z: float) -> None:
-        # "ign model" has no pose-setting flags in this version, so this
-        # goes straight through gz-transport's world set_pose service
-        # instead (note the "ignition.msgs" namespace, not "gz.msgs").
-        req = f'name: "{name}", position: {{x: {x}, y: {y}, z: {z}}}'
-        try:
-            subprocess.run(
-                ["ign", "service", "-s", f"/world/{GZ_WORLD_NAME}/set_pose",
-                 "--reqtype", "ignition.msgs.Pose",
-                 "--reptype", "ignition.msgs.Boolean",
-                 "--timeout", "2000",
-                 "--req", req],
-                capture_output=True, text=True, timeout=3.0,
-            )
-        except (subprocess.SubprocessError, OSError):
-            pass
+        request = SetEntityPose.Request()
+        request.entity.name = name
+        request.entity.type = Entity.MODEL
+        request.pose.position.x = x
+        request.pose.position.y = y
+        request.pose.position.z = z
+        request.pose.orientation.w = 1.0   # identity; omitting this leaves
+                                            # an invalid all-zero quaternion
+        future = self._set_pose_client.call_async(request)
+        result = self._wait_for_future(future)
+        if result is None or not result.success:
+            self.get_logger().warn(f"set_pose for '{name}' did not report success.")
 
     def _verify_grasp(self, model_name: str) -> bool:
         # A grasp only counts if the object actually ended up between the
