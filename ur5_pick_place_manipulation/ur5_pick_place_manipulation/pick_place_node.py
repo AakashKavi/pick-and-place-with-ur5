@@ -16,11 +16,54 @@ Pick-and-place sequence:
   6. Descend to PLACE pose (resting on top of the cube)
   7. Open gripper
   8. Retreat and return to HOME joint configuration
+
+-------------------------------------------------------------------------------
+Threading model
+-------------------------------------------------------------------------------
+This node blocks on action and service futures (send a goal, wait for the
+result) in the middle of what is, structurally, a single long-running ROS2
+callback: the /detected_objects subscription callback kicks off the whole
+8-step sequence and does not return until it finishes.
+
+Earlier version of this file: that callback ran under rclpy.spin(node),
+which is a SingleThreadedExecutor with exactly one spin thread. Blocking
+that one thread inside the callback is fatal, because the action/service
+result also has to be delivered BY that same thread's spin loop: the
+result future can never complete, the blocking call never returns, and the
+one thread that could dispatch the result is the one thread stuck waiting
+for it. That earlier version worked around this by running the sequence on
+a separate Python threading.Thread and busy-polling future.done() from
+there, which works but needed its own re-entrancy reasoning and left the
+default executor's single thread otherwise unused.
+
+This version instead uses a MultiThreadedExecutor with two callback groups:
+  - _sequence_group (MutuallyExclusiveCallbackGroup): owns the
+    /detected_objects subscription. Only one callback from this group runs
+    at a time, so the 8-step sequence still cannot be re-entered by a
+    second detection while it is running, same guarantee the is_executing
+    flag gave before, now enforced by rclpy itself rather than by hand.
+  - _client_group (ReentrantCallbackGroup): owns every action client,
+    service client, and the /joint_states subscription. Callbacks in a
+    Reentrant group can run concurrently with each other and with
+    callbacks from other groups, on other threads from the executor's pool.
+
+Because the sequence now runs on its own executor thread (from
+_sequence_group) and the action/service results are delivered by other
+executor threads (from _client_group), blocking or polling inside the
+sequence no longer starves anything: a different thread is free to process
+the result while this one waits. _wait_for_future below still polls
+future.done() in a short sleep loop rather than calling
+rclpy.spin_until_future_complete from inside the callback; that avoids
+re-entering the executor's own spin machinery altogether, which keeps the
+reasoning simple regardless of how many threads the executor has.
+-------------------------------------------------------------------------------
 """
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
 from geometry_msgs.msg import PoseArray, Pose, Quaternion
 from moveit_msgs.action import MoveGroup, ExecuteTrajectory
@@ -158,6 +201,23 @@ class PickPlaceNode(Node):
         super().__init__("pick_place_node")
 
         # ------------------------------------------------------------------
+        # Callback groups — see the threading model comment at the top of
+        # this file. _sequence_group serializes the pick-and-place sequence
+        # (one callback, mutually exclusive with itself); _client_group lets
+        # every action/service client and the joint state subscription be
+        # serviced concurrently, on other executor threads, while the
+        # sequence callback is blocked waiting on one of them.
+        # ------------------------------------------------------------------
+        self._sequence_group = MutuallyExclusiveCallbackGroup()
+        self._client_group = ReentrantCallbackGroup()
+
+        # Guards is_executing, _done, _attached_model: read from the
+        # sequence callback's thread and worth protecting defensively even
+        # though _sequence_group already prevents that callback from
+        # running concurrently with itself.
+        self._state_lock = threading.Lock()
+
+        # ------------------------------------------------------------------
         # TF2 buffer and listener
         # ------------------------------------------------------------------
         self.tf_buffer   = tf2_ros.Buffer()
@@ -166,7 +226,8 @@ class PickPlaceNode(Node):
         # ------------------------------------------------------------------
         # MoveGroup action client
         # ------------------------------------------------------------------
-        self._action_client = ActionClient(self, MoveGroup, "/move_action")
+        self._action_client = ActionClient(
+            self, MoveGroup, "/move_action", callback_group=self._client_group)
         self.get_logger().info("Waiting for MoveGroup action server...")
         self._action_client.wait_for_server()
         self.get_logger().info("MoveGroup action server connected.")
@@ -175,11 +236,13 @@ class PickPlaceNode(Node):
         # Cartesian path planning + execution, for short local moves
         # (descend/retreat) — see CARTESIAN_* constants for why.
         # ------------------------------------------------------------------
-        self._cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
+        self._cartesian_client = self.create_client(
+            GetCartesianPath, "/compute_cartesian_path", callback_group=self._client_group)
         self.get_logger().info("Waiting for /compute_cartesian_path service...")
         self._cartesian_client.wait_for_service()
 
-        self._execute_client = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
+        self._execute_client = ActionClient(
+            self, ExecuteTrajectory, "/execute_trajectory", callback_group=self._client_group)
         self.get_logger().info("Waiting for ExecuteTrajectory action server...")
         self._execute_client.wait_for_server()
         self.get_logger().info("Cartesian path planning connected.")
@@ -193,9 +256,12 @@ class PickPlaceNode(Node):
         # dedicated IK service — see _resolve_goal_joints for why.
         # ------------------------------------------------------------------
         self._latest_joint_state = None
-        self.create_subscription(JointState, "/joint_states", self._joint_state_cb, 10)
+        self.create_subscription(
+            JointState, "/joint_states", self._joint_state_cb, 10,
+            callback_group=self._client_group)
 
-        self._validity_client = self.create_client(GetStateValidity, "/check_state_validity")
+        self._validity_client = self.create_client(
+            GetStateValidity, "/check_state_validity", callback_group=self._client_group)
         self.get_logger().info("Waiting for /check_state_validity service...")
         self._validity_client.wait_for_service()
         self.get_logger().info("Spline trajectory planning connected.")
@@ -223,7 +289,8 @@ class PickPlaceNode(Node):
             PoseArray,
             "/detected_objects",
             self.objects_callback,
-            10
+            10,
+            callback_group=self._sequence_group,
         )
 
         self.is_executing = False
@@ -236,7 +303,12 @@ class PickPlaceNode(Node):
     # Planning scene setup
     # -----------------------------------------------------------------------
     def _add_table_collision_object(self) -> None:
-        client = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
+        # Called from __init__, before the executor starts spinning, so the
+        # callback group assignment here does not affect re-entrancy safety
+        # (there is no concurrent spinning yet for it to interact with) —
+        # set for consistency with every other client in this node.
+        client = self.create_client(
+            ApplyPlanningScene, "/apply_planning_scene", callback_group=self._client_group)
         self.get_logger().info("Waiting for /apply_planning_scene service...")
         client.wait_for_service()
 
@@ -262,6 +334,13 @@ class PickPlaceNode(Node):
         request = ApplyPlanningScene.Request()
         request.scene = scene
 
+        # rclpy.spin_until_future_complete is fine here specifically because
+        # this runs from __init__, before executor.spin() in main() has
+        # started — there is no running spin loop yet for this call to
+        # nest inside of. Everywhere else in this node that waits on a
+        # future does so from within a running callback instead, where that
+        # would not be true; see _wait_for_future and the threading model
+        # comment at the top of this file.
         future = client.call_async(request)
         rclpy.spin_until_future_complete(self, future)
         if future.result() is not None and future.result().success:
@@ -274,7 +353,9 @@ class PickPlaceNode(Node):
     # -----------------------------------------------------------------------
     
     def objects_callback(self, msg: PoseArray) -> None:
-        if self.is_executing or self._done or not msg.poses:
+        with self._state_lock:
+            busy_or_done = self.is_executing or self._done
+        if busy_or_done or not msg.poses:
             return
 
         cylinder_gt = self._get_model_pose(GRASP_TARGET_MODEL)
@@ -314,22 +395,25 @@ class PickPlaceNode(Node):
         target_pose.position.z = cylinder_gt[2]
         target_pose.orientation = self._down_orientation()
 
-        # Run the actual sequence on a worker thread, not this callback.
-        # _move_to_pose blocks on action-result futures; if it ran here it
-        # would nest inside the very rclpy.spin(node) loop that has to
-        # dispatch those results, which is exactly the re-entrancy hazard
-        # _wait_for_future's docstring above describes. On a separate
-        # thread it can safely poll while spin(node) keeps running.
-        self.is_executing = True
-        threading.Thread(
-            target=self._run_pick_and_place, args=(target_pose,), daemon=True
-        ).start()
+        # Run the sequence directly on this callback's own executor thread
+        # (this callback belongs to _sequence_group, a
+        # MutuallyExclusiveCallbackGroup, so the MultiThreadedExecutor gives
+        # it a dedicated thread and will not dispatch a second concurrent
+        # invocation of it). _move_to_pose and friends still block on
+        # action/service futures, but that is safe here: the futures are
+        # completed by _client_group callbacks running on other executor
+        # threads, not by this one. See the threading model comment at the
+        # top of this file.
+        with self._state_lock:
+            self.is_executing = True
+        self._run_pick_and_place(target_pose)
 
     def _run_pick_and_place(self, target_pose: Pose) -> None:
         try:
             self._execute_pick_and_place(target_pose)
         finally:
-            self.is_executing = False
+            with self._state_lock:
+                self.is_executing = False
 
     @staticmethod
     def _camera_pose_to_robot(cam: Pose):
@@ -390,8 +474,9 @@ class PickPlaceNode(Node):
             self._send_gripper_command(GRIPPER_CLOSED)
 
             if self._verify_grasp(GRASP_TARGET_MODEL):
-                self._attached_model = GRASP_TARGET_MODEL
-                self.get_logger().info(f"Object grasped: {self._attached_model}")
+                with self._state_lock:
+                    self._attached_model = GRASP_TARGET_MODEL
+                self.get_logger().info(f"Object grasped: {GRASP_TARGET_MODEL}")
                 grasped = True
                 break
 
@@ -426,13 +511,15 @@ class PickPlaceNode(Node):
 
         self.get_logger().info("Step 7/8 — Releasing onto the cube...")
         self._send_gripper_command(GRIPPER_OPEN)
-        self._attached_model = None
+        with self._state_lock:
+            self._attached_model = None
 
         self.get_logger().info("Step 8/8 — Retreating and returning home...")
         self._move_linear(pre_place_pose)
         self._move_to_home()
 
-        self._done = True
+        with self._state_lock:
+            self._done = True
         self.get_logger().info("Pick-and-place complete: cylinder placed on the cube!")
 
     # -----------------------------------------------------------------------
@@ -510,7 +597,9 @@ class PickPlaceNode(Node):
         return dist < GRASP_VERIFY_RADIUS
 
     def _sync_attached_model_pose(self) -> None:
-        if not self._attached_model:
+        with self._state_lock:
+            attached_model = self._attached_model
+        if not attached_model:
             return
         try:
             tf = self.tf_buffer.lookup_transform(
@@ -520,7 +609,7 @@ class PickPlaceNode(Node):
             self.get_logger().warn(f"Could not look up gripper_tcp in world frame: {ex}")
             return
         t = tf.transform.translation
-        self._set_model_pose(self._attached_model, t.x, t.y, t.z)
+        self._set_model_pose(attached_model, t.x, t.y, t.z)
 
     # -----------------------------------------------------------------------
     # Straight-line move for short local motions (descend/retreat) — see the
@@ -815,13 +904,12 @@ class PickPlaceNode(Node):
         return self._send_goal(goal)
 
     # -----------------------------------------------------------------------
-    # Wait for a future without spinning — this is called from a worker
-    # thread (see _run_pick_and_place), never from inside a callback. The
-    # one real spin loop is rclpy.spin(node) in main(), running concurrently
-    # on the main thread; nesting rclpy.spin_until_future_complete() inside
-    # a callback that spin loop is already dispatching is a known rclpy
-    # re-entrancy hazard — the goal-acceptance future reliably resolves that
-    # way, but the action *result* future reliably never does.
+    # Wait for a future without calling into rclpy's own spin machinery.
+    # This runs on the _sequence_group executor thread, inside what is
+    # structurally a subscription callback (see the threading model comment
+    # at the top of this file). The future it waits on is completed by a
+    # _client_group callback on a different executor thread, so plain
+    # polling here is sufficient and avoids re-entering spin() altogether.
     # -----------------------------------------------------------------------
     @staticmethod
     def _wait_for_future(future):
@@ -863,8 +951,22 @@ class PickPlaceNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = PickPlaceNode()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    # 4 threads: one is effectively reserved for the sequence callback
+    # (_sequence_group only ever runs one callback at a time regardless of
+    # how many threads are available), the rest service _client_group
+    # (action/service results, /joint_states) concurrently while the
+    # sequence is blocked. See the threading model comment at the top of
+    # this file for why this replaces the previous worker-thread approach.
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
