@@ -11,6 +11,8 @@
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
+#include "ur5_pick_place_perception/clustering.hpp"
+
 class ObjectDetectorNode : public rclcpp::Node
 {
 public:
@@ -28,9 +30,6 @@ private:
     const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud);
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr removePlane(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud);
-
-  std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> extractClusters(
     const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud);
 
   geometry_msgs::msg::Pose clusterToPose(

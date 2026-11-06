@@ -19,6 +19,7 @@ find_package(PCL REQUIRED COMPONENTS common filters segmentation kdtree)
 # Object detector node
 add_executable(object_detector
   src/object_detector.cpp
+  src/clustering.cpp
 )
 
 target_include_directories(object_detector
@@ -50,5 +51,25 @@ install(TARGETS object_detector
 install(DIRECTORY include/
   DESTINATION include/
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+
+  ament_add_gtest(test_clustering
+    test/test_clustering.cpp
+    src/clustering.cpp
+  )
+
+  target_include_directories(test_clustering
+    PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    PRIVATE
+      ${PCL_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(test_clustering
+    ${PCL_LIBRARIES}
+  )
+endif()
 
 ament_package()

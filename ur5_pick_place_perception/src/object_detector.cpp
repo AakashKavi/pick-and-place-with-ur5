@@ -6,8 +6,6 @@
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/segmentation/extract_clusters.h>
-#include <pcl/kdtree/kdtree.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <std_msgs/msg/header.hpp>
 
@@ -100,7 +98,8 @@ void ObjectDetectorNode::pointcloudCallback(
   auto downsampled  = downsample(cloud);
   auto filtered     = passthroughFilter(downsampled);
   auto objects_only = enable_plane_removal_ ? removePlane(filtered) : filtered;
-  auto clusters     = extractClusters(objects_only);
+  auto clusters     = ur5_pick_place_perception::extractClusters(
+    objects_only, cluster_tolerance_, min_cluster_size_, max_cluster_size_);
 
   // Build PoseArray from cluster centroids
   geometry_msgs::msg::PoseArray pose_array;
@@ -200,42 +199,13 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr ObjectDetectorNode::removePlane(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 4: Euclidean Cluster Extraction
-//
-// Points that are close together (within cluster_tolerance) get grouped into
-// one cluster — each cluster represents one object. This works like grouping
-// islands on a map: if two pieces of land are close enough, they belong to
-// the same island.
+// Stage 4: Euclidean Cluster Extraction — see
+// ur5_pick_place_perception::extractClusters in clustering.hpp/.cpp. Moved
+// there as a free function, parameterized explicitly instead of reading
+// cluster_tolerance_/min_cluster_size_/max_cluster_size_ off this node's
+// state, so it can be unit tested on a synthetic cloud without
+// constructing a full rclcpp node (test/test_clustering.cpp).
 // ---------------------------------------------------------------------------
-std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> ObjectDetectorNode::extractClusters(
-  const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud)
-{
-  std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> result;
-
-  if (cloud->empty()) return result;
-
-  pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
-  tree->setInputCloud(cloud);
-
-  std::vector<pcl::PointIndices> cluster_indices;
-  pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-  ec.setClusterTolerance(cluster_tolerance_);
-  ec.setMinClusterSize(min_cluster_size_);
-  ec.setMaxClusterSize(max_cluster_size_);
-  ec.setSearchMethod(tree);
-  ec.setInputCloud(cloud);
-  ec.extract(cluster_indices);
-
-  for (const auto & indices : cluster_indices) {
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
-    for (int idx : indices.indices) {
-      cluster->push_back(cloud->points[idx]);
-    }
-    result.push_back(cluster);
-  }
-
-  return result;
-}
 
 // ---------------------------------------------------------------------------
 // Compute centroid of a cluster and return as a Pose
