@@ -29,6 +29,7 @@ The simulation runs on ROS2 Humble with the new Gazebo (gz-sim), using the offic
 * **Full perception-to-manipulation pipeline** — depth camera → PCL clustering → MoveIt 2 pick-and-place sequence, all connected over ROS2 topics
 * **Custom mock parallel-jaw gripper** — added on top of the stock UR5e, driven directly by a gz-sim `JointPositionController` plugin, sized to actually fit around the scene's objects
 * **Pick-and-place, not just pick** — identifies the cylinder vs. the cube (via nearest-match against ground truth, since perception doesn't classify shape), picks the cylinder up and stacks it on the cube
+* **Grasp target comes from Gazebo ground truth, not the raw detection**: a top-down camera only ever sees an object's top surface, so perception's detected z is biased high; the actual grasp pose is read from Gazebo directly, perception only confirms the object is currently visible, see Key Insight
 * **Collision-aware planning** — the table is registered with MoveIt as a real `CollisionObject`, so motions are actually planned around it instead of just being statically unlikely to hit it
 * **Mixed trajectory types per motion** — long transit moves use a cubic-spline joint trajectory (smooth single accelerate/decelerate blend, collision-checked per waypoint); short local moves (descend/retreat to grasp or place) use Cartesian linear interpolation so the end effector travels a straight line instead of an arbitrary joint-space path
 * **Grasp verification + retry** — after closing the gripper, checks the object's actual Gazebo pose against the gripper's actual pose (not just the planned target) before declaring success; retries the whole approach up to 3 times if the grasp missed
@@ -181,6 +182,12 @@ The fix required three changes:
 ### The passthrough crop is doing double duty
 
 The perception pipeline's passthrough filter exists to crop the raw point cloud down to the workspace volume. For this specific scene it also happens to remove the table surface for free: the table top sits 0.80 m deep from the camera (camera at z=1.30, table top at z=0.500, see `pick_place.sdf`), and the crop's upper bound is 0.79 m, just short of that. That is why RANSAC plane removal (`removePlane()`, wired in behind the `enable_plane_removal` parameter, default false) is not needed in this scene. It will be needed again if the table height, camera mount height, or object sizes change enough to close that 0.01 m margin.
+
+### Grasp target: Gazebo ground truth, not the raw detection
+
+The arm does not grasp at the pose `object_detector` publishes. `pick_place_node` reads the cylinder's actual pose from Gazebo (`ign model -m blue_cylinder -p`) and builds the grasp target from that instead. The detected pose on `/detected_objects` is only used to confirm perception can currently see the cylinder, by nearest-position match against the ground truth pose, since perception does not classify shape.
+
+The reason is geometric, not a shortcut. A single downward depth camera only ever sees the top surface of an object, never its center. Using the detected position directly would put the grasp target's z roughly one object half-height too high, closing the gripper above the cylinder's body instead of around it.
 
 ---
 
