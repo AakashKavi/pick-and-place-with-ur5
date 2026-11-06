@@ -39,4 +39,5 @@ jobs:
       - name: Run tests
         run: |
           source /opt/ros/humble/setup.bash
-          colcon test --return-code-on-test-failure
+          colcon test
+          colcon test-result --all --verbose
