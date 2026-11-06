@@ -27,18 +27,18 @@ The simulation runs on ROS2 Humble with the new Gazebo (gz-sim), using the offic
 ##  Key Features
 
 * **Full perception-to-manipulation pipeline** — depth camera → PCL clustering → MoveIt 2 pick-and-place sequence, all connected over ROS2 topics
-* **Custom mock parallel-jaw gripper** — added on top of the stock UR5e, driven directly by a gz-sim `JointPositionController` plugin, sized to actually fit around the scene's objects
+* **Custom mock parallel-jaw gripper**: added on top of the stock UR5e, driven directly by a gz-sim `JointPositionController` plugin, sized to actually fit around the scene's objects; gripper commands wait on the real `/joint_states` feedback for the finger to actually reach its target instead of a fixed sleep
 * **Pick-and-place, not just pick** — identifies the cylinder vs. the cube (via nearest-match against ground truth, since perception doesn't classify shape), picks the cylinder up and stacks it on the cube
 * **Grasp target comes from Gazebo ground truth, not the raw detection**: a top-down camera only ever sees an object's top surface, so perception's detected z is biased high; the actual grasp pose is read from Gazebo directly, perception only confirms the object is currently visible, see Key Insight
-* **Collision-aware planning** — the table is registered with MoveIt as a real `CollisionObject`, so motions are actually planned around it instead of just being statically unlikely to hit it
-* **Mixed trajectory types per motion** — long transit moves use a cubic-spline joint trajectory (smooth single accelerate/decelerate blend, collision-checked per waypoint); short local moves (descend/retreat to grasp or place) use Cartesian linear interpolation so the end effector travels a straight line instead of an arbitrary joint-space path
+* **Collision-aware planning**: the table, cube, and cylinder are all registered with MoveIt as real `CollisionObject`s (read from Gazebo ground truth at startup), so motions are actually planned around them instead of just being statically unlikely to hit them; the grasped cylinder is reattached to the gripper as an `AttachedCollisionObject` on grasp and detached on release, with explicit `touch_links` so the closed gripper isn't treated as a collision with what it's holding
+* **Mixed trajectory types per motion**: long transit moves use a cubic-spline joint trajectory (smooth single accelerate/decelerate blend) sized per move from the robot's real velocity and acceleration limits instead of a fixed duration, with a validity-check count that scales with how far the move travels; short local moves (descend/retreat to grasp or place) use Cartesian linear interpolation so the end effector travels a straight line instead of an arbitrary joint-space path
 * **Grasp verification + retry** — after closing the gripper, checks the object's actual Gazebo pose against the gripper's actual pose (not just the planned target) before declaring success; retries the whole approach up to 3 times if the grasp missed
 * **Kinematic attach** — since the gripper doesn't grip via contact physics, a held object's Gazebo pose is teleported to track the gripper between waypoints
 * **New Gazebo (gz-sim) compatible** — world file written in SDF 1.9 with gz-sim system plugins, not Gazebo Classic syntax
 * **ros_gz_bridge integration**: explicit bridge nodes translate the depth point cloud, the gripper command topic, ground-truth model poses, and the kinematic-attach set_pose service between ROS2 and Gazebo, see Topics
 * **C++ PCL perception node**: voxel grid downsampling, passthrough crop, then Euclidean cluster extraction by default; RANSAC plane removal is implemented and available behind an `enable_plane_removal` parameter (default false), not needed for this scene since the passthrough crop already excludes the table, see Key Insight
 * **RViz marker visualization** — detected object centroids published as `visualization_msgs/MarkerArray` for real-time inspection
-* **GitHub Actions CI** — automated build check on every push
+* **GitHub Actions CI**: builds the workspace and runs the test suite (pytest unit tests for the pure motion math, gtest for perception clustering) on every push, failing the job if any test fails
 
 ---
 
