@@ -1,6 +1,7 @@
 #include "ur5_pick_place_perception/object_detector.hpp"
 
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/extract_indices.h>
@@ -71,6 +72,16 @@ void ObjectDetectorNode::pointcloudCallback(
   // Convert from ROS message to PCL type
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
   pcl::fromROSMsg(*msg, *cloud);
+
+  // The gz-sim depth camera can publish NaN points (see README: known to
+  // happen in headless mode, not verified absent in GUI mode either), and
+  // every downstream PCL filter below assumes finite coordinates. Drop them
+  // here, once, rather than letting each stage guess whether its input is
+  // clean. A cloud that is all-NaN becomes genuinely empty after this and
+  // is caught by the empty check right below, same as a cloud with zero
+  // points to begin with.
+  std::vector<int> finite_indices;
+  pcl::removeNaNFromPointCloud(*cloud, *cloud, finite_indices);
 
   if (cloud->empty()) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
