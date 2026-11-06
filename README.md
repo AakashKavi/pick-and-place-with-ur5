@@ -35,7 +35,7 @@ The simulation runs on ROS2 Humble with the new Gazebo (gz-sim), using the offic
 * **Kinematic attach** — since the gripper doesn't grip via contact physics, a held object's Gazebo pose is teleported to track the gripper between waypoints
 * **New Gazebo (gz-sim) compatible** — world file written in SDF 1.9 with gz-sim system plugins, not Gazebo Classic syntax
 * **ros_gz_bridge integration** — explicit bridge nodes translate `gz.msgs.PointCloudPacked` and the gripper command topic between ROS2 and Gazebo
-* **C++ PCL perception node** — four-stage pipeline: voxel grid downsampling → passthrough filter → RANSAC plane removal → Euclidean cluster extraction
+* **C++ PCL perception node**: voxel grid downsampling, passthrough crop, then Euclidean cluster extraction by default; RANSAC plane removal is implemented and available behind an `enable_plane_removal` parameter (default false), not needed for this scene since the passthrough crop already excludes the table, see Key Insight
 * **RViz marker visualization** — detected object centroids published as `visualization_msgs/MarkerArray` for real-time inspection
 * **GitHub Actions CI** — automated build check on every push
 
@@ -163,18 +163,24 @@ flowchart TD
 
 ---
 
-## Key Insight: Gazebo Classic vs New Gazebo
+## Key Insight
 
-The biggest debugging challenge in this project was not the perception or manipulation code — it was the camera.
+### Gazebo Classic vs New Gazebo
+
+The biggest debugging challenge in this project was not the perception or manipulation code. It was the camera.
 
 `ur_simulation_gz` (the official UR ROS2 driver) runs on the **new Gazebo (gz-sim/Ignition)**, not Gazebo Classic. The two versions look similar on the surface but use completely different plugin architectures under the hood.
 
-The initial world file used Gazebo Classic syntax (`libgazebo_ros_camera.so`, `<ros>` topic remappings). This produced no errors — it simply did nothing, silently, in the new Gazebo.
+The initial world file used Gazebo Classic syntax (`libgazebo_ros_camera.so`, `<ros>` topic remappings). This produced no errors. It simply did nothing, silently, in the new Gazebo.
 
 The fix required three changes:
 1. Rewrite the world file in SDF 1.9 with gz-sim system plugins (`gz-sim-sensors-system`, `gz-sim-physics-system`, etc.)
 2. Declare the camera sensor using gz-sim's native `depth_camera` type with a `<topic>` tag
 3. Add an explicit `ros_gz_bridge` node in the launch file to translate `gz.msgs.PointCloudPacked` into ROS2 `sensor_msgs/PointCloud2`
+
+### The passthrough crop is doing double duty
+
+The perception pipeline's passthrough filter exists to crop the raw point cloud down to the workspace volume. For this specific scene it also happens to remove the table surface for free: the table top sits 0.80 m deep from the camera (camera at z=1.30, table top at z=0.500, see `pick_place.sdf`), and the crop's upper bound is 0.79 m, just short of that. That is why RANSAC plane removal (`removePlane()`, wired in behind the `enable_plane_removal` parameter, default false) is not needed in this scene. It will be needed again if the table height, camera mount height, or object sizes change enough to close that 0.01 m margin.
 
 ---
 
