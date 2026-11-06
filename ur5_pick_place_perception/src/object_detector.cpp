@@ -24,6 +24,7 @@ ObjectDetectorNode::ObjectDetectorNode()
   this->declare_parameter("passthrough_max_z",      0.79);
   this->declare_parameter("voxel_leaf_size",        0.01);
   this->declare_parameter("plane_distance_threshold", 0.01);
+  this->declare_parameter("enable_plane_removal", false);
 
   cluster_tolerance_        = this->get_parameter("cluster_tolerance").as_double();
   min_cluster_size_         = this->get_parameter("min_cluster_size").as_int();
@@ -32,6 +33,7 @@ ObjectDetectorNode::ObjectDetectorNode()
   passthrough_max_z_        = this->get_parameter("passthrough_max_z").as_double();
   voxel_leaf_size_          = this->get_parameter("voxel_leaf_size").as_double();
   plane_distance_threshold_ = this->get_parameter("plane_distance_threshold").as_double();
+  enable_plane_removal_     = this->get_parameter("enable_plane_removal").as_bool();
 
   // Subscriber
   pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -65,10 +67,17 @@ void ObjectDetectorNode::pointcloudCallback(
   }
 
   // --- Pipeline ---
+  // Plane removal is optional (enable_plane_removal, default false): the
+  // passthrough crop below already excludes the table surface for this
+  // specific camera/table geometry (table top is at 0.80 m depth from the
+  // camera, the crop's upper bound is 0.79 m), so RANSAC plane removal is
+  // redundant work here. It is kept available and wired in because that
+  // depth margin is scene-specific and will not hold for a different
+  // table height or camera mount.
   auto downsampled  = downsample(cloud);
   auto filtered     = passthroughFilter(downsampled);
-  //auto objects_only = removePlane(filtered);
-  auto clusters     = extractClusters(filtered);
+  auto objects_only = enable_plane_removal_ ? removePlane(filtered) : filtered;
+  auto clusters     = extractClusters(objects_only);
 
   // Build PoseArray from cluster centroids
   geometry_msgs::msg::PoseArray pose_array;

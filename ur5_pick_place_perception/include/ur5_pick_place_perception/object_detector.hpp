@@ -51,4 +51,5 @@ private:
   double passthrough_max_z_;
   double voxel_leaf_size_;
   double plane_distance_threshold_;
+  bool enable_plane_removal_;
 };
