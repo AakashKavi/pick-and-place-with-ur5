@@ -1,6 +1,6 @@
 # ROS2 Vision-Based Pick and Place with UR5e
 
-[![ROS2 Build](https://github.com/AakashKavi/ros2_ur5_vision_grasp/actions/workflows/ci.yml/badge.svg)](https://github.com/AakashKavi/ros2_ur5_vision_grasp/actions/workflows/ci.yml)
+[![ROS2 Build](https://github.com/AakashKavi/pick-and-place-with-ur5/actions/workflows/ci.yml/badge.svg)](https://github.com/AakashKavi/pick-and-place-with-ur5/actions/workflows/ci.yml)
 
 ### Closing the loop between 3D point cloud perception and industrial arm motion planning — entirely in simulation, no custom robot configuration required.
 
@@ -67,7 +67,7 @@ sudo apt install \
 # Clone into your ROS2 workspace
 mkdir -p ~/ros2_ws/src
 cd ~/ros2_ws/src
-git clone https://github.com/AakashKavi/ros2_ur5_vision_grasp.git
+git clone https://github.com/AakashKavi/pick-and-place-with-ur5.git
 
 # Resolve dependencies
 cd ~/ros2_ws
@@ -204,4 +204,4 @@ The fix required three changes:
 
 **Aakash Kavi** — Robotics and Automation Engineer  
 M.Sc. Mechatronics, Hochschule Ravensburg-Weingarten  
-[LinkedIn](https://linkedin.com/in/YOUR_PROFILE) | [GitHub](https://github.com/AakashKavi)
+LinkedIn: TODO add your profile link here | [GitHub](https://github.com/AakashKavi)
