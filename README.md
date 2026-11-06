@@ -35,7 +35,7 @@ The simulation runs on ROS2 Humble with the new Gazebo (gz-sim), using the offic
 * **Grasp verification + retry** — after closing the gripper, checks the object's actual Gazebo pose against the gripper's actual pose (not just the planned target) before declaring success; retries the whole approach up to 3 times if the grasp missed
 * **Kinematic attach** — since the gripper doesn't grip via contact physics, a held object's Gazebo pose is teleported to track the gripper between waypoints
 * **New Gazebo (gz-sim) compatible** — world file written in SDF 1.9 with gz-sim system plugins, not Gazebo Classic syntax
-* **ros_gz_bridge integration** — explicit bridge nodes translate `gz.msgs.PointCloudPacked` and the gripper command topic between ROS2 and Gazebo
+* **ros_gz_bridge integration**: explicit bridge nodes translate the depth point cloud, the gripper command topic, ground-truth model poses, and the kinematic-attach set_pose service between ROS2 and Gazebo, see Topics
 * **C++ PCL perception node**: voxel grid downsampling, passthrough crop, then Euclidean cluster extraction by default; RANSAC plane removal is implemented and available behind an `enable_plane_removal` parameter (default false), not needed for this scene since the passthrough crop already excludes the table, see Key Insight
 * **RViz marker visualization** — detected object centroids published as `visualization_msgs/MarkerArray` for real-time inspection
 * **GitHub Actions CI** — automated build check on every push
@@ -185,20 +185,30 @@ The perception pipeline's passthrough filter exists to crop the raw point cloud 
 
 ### Grasp target: Gazebo ground truth, not the raw detection
 
-The arm does not grasp at the pose `object_detector` publishes. `pick_place_node` reads the cylinder's actual pose from Gazebo (`ign model -m blue_cylinder -p`) and builds the grasp target from that instead. The detected pose on `/detected_objects` is only used to confirm perception can currently see the cylinder, by nearest-position match against the ground truth pose, since perception does not classify shape.
+The arm does not grasp at the pose `object_detector` publishes. `pick_place_node` reads the cylinder's actual pose from Gazebo (via a `tf2_msgs/TFMessage` bridged from gz-sim's own `dynamic_pose/info` topic, see below) and builds the grasp target from that instead. The detected pose on `/detected_objects` is only used to confirm perception can currently see the cylinder, by nearest-position match against the ground truth pose, since perception does not classify shape.
 
 The reason is geometric, not a shortcut. A single downward depth camera only ever sees the top surface of an object, never its center. Using the detected position directly would put the grasp target's z roughly one object half-height too high, closing the gripper above the cylinder's body instead of around it.
+
+### QoS: why a subscriber can silently receive nothing
+
+Every topic has a QoS (Quality of Service) profile on each side, publisher and subscriber independently. `/camera/depth/points` is subscribed to with `SensorDataQoS()` (best effort, volatile, shallow history) rather than the default, because it is high rate sensor data where dropping an old frame is fine and never worth blocking on. `/detected_objects` uses the plain default profile (reliable, volatile, depth 10) on both the publisher and subscriber side.
+
+The rule that matters: a subscriber can only receive from a publisher if its QoS is equal to or weaker than what the publisher offers. A reliable subscriber against a best effort publisher is the classic mismatch, and it fails silently. No error, no crash, the subscription just never receives anything, which looks identical to "the publisher isn't running" from the subscriber's side.
+
+To actually see this instead of guessing: `ros2 topic info /camera/depth/points -v` prints the full QoS profile for every publisher and subscriber on a topic, side by side. That `-v` is the first thing to reach for when a topic looks connected but nothing is arriving.
 
 ---
 
 ## Topics
 
-| Topic | Type | Direction |
+| Topic / Service | Type | Direction |
 |---|---|---|
 | `/camera/depth/points` | `sensor_msgs/PointCloud2` | Camera → Perception |
 | `/detected_objects` | `geometry_msgs/PoseArray` | Perception → Manipulation |
 | `/detected_objects_markers` | `visualization_msgs/MarkerArray` | Perception → RViz |
 | `/gripper_position_cmd` | `std_msgs/Float64` | Manipulation → Gripper (gz `JointPositionController`) |
+| `/world/pick_place_world/dynamic_pose/info` | `tf2_msgs/TFMessage` | Gazebo → Manipulation (ground truth model poses) |
+| `/world/pick_place_world/set_pose` (service) | `ros_gz_interfaces/SetEntityPose` | Manipulation → Gazebo (kinematic attach teleport) |
 
 ---
 
