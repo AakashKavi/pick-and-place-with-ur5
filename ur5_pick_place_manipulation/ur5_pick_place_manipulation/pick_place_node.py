@@ -108,6 +108,7 @@ import tf2_geometry_msgs  # do_transform_pose, and registers Pose types with tf2
 from scipy.interpolate import CubicSpline
 
 import copy
+import math
 import subprocess
 import threading
 import time
@@ -175,8 +176,31 @@ ARM_JOINT_NAMES = [
     "wrist_3_joint",
 ]
 HOME_JOINT_VALUES = [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
-SPLINE_DURATION = 4.0   # seconds
+
+# Per-joint velocity/acceleration budget for the spline, scaled by the same
+# MAX_VELOCITY/MAX_ACCEL factors the OMPL-planned moves use, so a spline
+# move is not faster than a planned one would be for the same displacement.
+# Source values: UR5e's max_velocity is a uniform pi rad/s (180 deg/s) for
+# every joint (/opt/ros/humble/share/ur_description/config/ur5e/
+# joint_limits.yaml); max_acceleration is 5.0 rad/s^2 for every joint, set
+# by this project's own moveit_config override
+# (ur5_pick_place_moveit_config/config/joint_limits.yaml), since the base
+# URDF does not publish acceleration limits at all.
+MAX_JOINT_VELOCITY = 3.14159265 * MAX_VELOCITY   # rad/s
+MAX_JOINT_ACCEL     = 5.0 * MAX_ACCEL              # rad/s^2
+MIN_SPLINE_DURATION = 1.0   # seconds; floor so a tiny displacement does not
+                             # get an unreasonably short, jerky trajectory
 SPLINE_STEPS    = 40    # trajectory points sampled along the spline
+
+# Spacing (in combined joint-space distance, radians) targeted between
+# /check_state_validity calls along a spline move — see
+# _move_spline_to_joints and _trajectory_is_valid. A longer move gets
+# proportionally more checks instead of every move getting the same fixed
+# count regardless of how far it travels. Smaller spacing catches thinner
+# obstacles at the cost of more service calls per move; this value is not
+# derived from anything physical, it is a judgment call between those two.
+VALIDITY_CHECK_SPACING = 0.05   # rad
+MIN_VALIDITY_CHECKS = 5          # floor so a tiny move still gets checked
 
 # Gripper (see ur5_pick_place_description/urdf/gripper.xacro for the joint
 # limits these correspond to)
@@ -861,19 +885,56 @@ class PickPlaceNode(Node):
             return None
 
     @staticmethod
+    def _spline_duration(start: list, goal: list) -> float:
+        # Duration long enough that a per-joint cubic spline (zero velocity
+        # at both ends) from start to goal stays within MAX_JOINT_VELOCITY
+        # and MAX_JOINT_ACCEL, with a MIN_SPLINE_DURATION floor.
+        #
+        # For a single cubic segment clamped to zero velocity at both ends,
+        # peak velocity = 1.5 * displacement / T (standard result for this
+        # boundary condition), which gives a first estimate of T from the
+        # velocity budget alone. That estimate is not just trusted for
+        # acceleration too: a trial spline is built at that duration and
+        # its actual second derivative is sampled, since what matters is
+        # what the spline really does, not just the analytical formula.
+        # Acceleration scales as 1/T^2 for a fixed displacement, so if the
+        # sampled peak exceeds the budget, this scales T up by exactly the
+        # factor needed rather than guessing and re-checking.
+        max_disp = max(abs(g - s) for s, g in zip(start, goal))
+        duration = max(MIN_SPLINE_DURATION, 1.5 * max_disp / MAX_JOINT_VELOCITY)
+
+        trial_splines = [
+            CubicSpline([0.0, duration], [s, g], bc_type=((1, 0.0), (1, 0.0)))
+            for s, g in zip(start, goal)
+        ]
+        sample_times = [duration * i / 100.0 for i in range(101)]
+        peak_accel = max(
+            abs(spline(t, 2)) for spline in trial_splines for t in sample_times
+        )
+        if peak_accel > MAX_JOINT_ACCEL:
+            duration *= (peak_accel / MAX_JOINT_ACCEL) ** 0.5
+
+        return max(duration, MIN_SPLINE_DURATION)
+
+    @staticmethod
     def _build_spline_trajectory(start: list, goal: list) -> RobotTrajectory:
         # Per-joint cubic spline, clamped to zero velocity at both ends —
         # a single smooth accelerate/decelerate blend from start to goal,
         # instead of RRTConnect's piecewise-linear joint-space path.
+        # Duration is sized per move from this specific displacement (see
+        # _spline_duration) instead of a fixed constant, so a small move
+        # finishes quickly and a large one still respects the
+        # velocity/acceleration budget rather than silently exceeding it.
+        duration = PickPlaceNode._spline_duration(start, goal)
         splines = [
-            CubicSpline([0.0, SPLINE_DURATION], [s, g], bc_type=((1, 0.0), (1, 0.0)))
+            CubicSpline([0.0, duration], [s, g], bc_type=((1, 0.0), (1, 0.0)))
             for s, g in zip(start, goal)
         ]
 
         trajectory = RobotTrajectory()
         trajectory.joint_trajectory.joint_names = list(ARM_JOINT_NAMES)
         for i in range(SPLINE_STEPS + 1):
-            t = SPLINE_DURATION * i / SPLINE_STEPS
+            t = duration * i / SPLINE_STEPS
             point = JointTrajectoryPoint()
             point.positions = [float(s(t)) for s in splines]
             point.velocities = [float(s(t, 1)) for s in splines]
@@ -883,11 +944,45 @@ class PickPlaceNode(Node):
             trajectory.joint_trajectory.points.append(point)
         return trajectory
 
-    def _trajectory_is_valid(self, trajectory: RobotTrajectory) -> bool:
+    @staticmethod
+    def _path_length(start: list, goal: list) -> float:
+        # Straight-line distance in joint space (radians), unweighted
+        # across joints — same simple convention _spline_duration's
+        # max_disp already uses, not a true spline arc length.
+        return math.sqrt(sum((g - s) ** 2 for s, g in zip(start, goal)))
+
+    def _trajectory_is_valid(self, trajectory: RobotTrajectory, num_checks: int) -> bool:
         # Bypassing OMPL for spline moves also bypasses its collision
-        # checking, so check each waypoint against the planning scene
-        # (table included) before committing to executing it.
-        for point in trajectory.joint_trajectory.points:
+        # checking, so check waypoints against the planning scene (table,
+        # cube, cylinder included) before committing to executing it.
+        #
+        # num_checks is derived from the joint-space path length (see
+        # _move_spline_to_joints), not fixed, so a long move gets
+        # proportionally more checks than a short one instead of every move
+        # getting the same count regardless of how far it travels. Capped
+        # at however many points the built trajectory actually has
+        # (SPLINE_STEPS+1) — checking more distinct configurations than
+        # exist as discrete points would need re-sampling the spline
+        # itself, not done here.
+        #
+        # REMAINING LIMITATION: this only checks a finite number of
+        # discrete points along a continuous path. A thin obstacle that
+        # lies entirely between two consecutive checked points can still
+        # be missed. VALIDITY_CHECK_SPACING trades that risk against the
+        # number of /check_state_validity calls per move; it is not a
+        # guarantee of continuous collision checking the way OMPL's own
+        # checking is.
+        points = trajectory.joint_trajectory.points
+        if num_checks >= len(points):
+            indices = range(len(points))
+        else:
+            indices = sorted({
+                round(i * (len(points) - 1) / (num_checks - 1))
+                for i in range(num_checks)
+            })
+
+        for idx in indices:
+            point = points[idx]
             request = GetStateValidity.Request()
             request.group_name = PLANNING_GROUP
             request.robot_state.joint_state.name = list(ARM_JOINT_NAMES)
@@ -910,7 +1005,12 @@ class PickPlaceNode(Node):
             return None
 
         trajectory = self._build_spline_trajectory(start, goal)
-        if not self._trajectory_is_valid(trajectory):
+        path_length = self._path_length(start, goal)
+        num_checks = max(
+            MIN_VALIDITY_CHECKS,
+            math.ceil(path_length / VALIDITY_CHECK_SPACING) + 1,
+        )
+        if not self._trajectory_is_valid(trajectory, num_checks):
             self.get_logger().warn(
                 "Spline path would collide with the planning scene; "
                 "falling back to joint-space planning."
