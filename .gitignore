@@ -15,4 +15,21 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# SSH / key material (never commit these)
+id_*
 *.pub
+*.pem
+*.key
+
+# Diagram tool output and tf frame dumps, not project deliverables
+.archify/
+frames_*.gv
+frames_*.pdf
+
+# Local-only working notes, never pushed
+PROGRESS.md
+DECISIONS.md
+INTERVIEW_NOTES.md
+SECURITY_CLEANUP.md
+test_logs/
