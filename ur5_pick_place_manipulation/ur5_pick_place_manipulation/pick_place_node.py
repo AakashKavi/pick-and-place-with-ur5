@@ -92,6 +92,7 @@ from moveit_msgs.msg import (
     BoundingVolume,
     JointConstraint,
     CollisionObject,
+    AttachedCollisionObject,
     PlanningScene,
     RobotTrajectory,
 )
@@ -206,6 +207,7 @@ PLACE_TARGET_MODEL   = "red_box"
 # centered on top of the cube: place_z = cube_z + half_cube + half_cylinder.
 CUBE_HALF_HEIGHT      = 0.025   # red_box: 0.05 cube
 CYLINDER_HALF_LENGTH  = 0.030   # blue_cylinder: length 0.06
+CYLINDER_RADIUS        = 0.025   # blue_cylinder radius, see pick_place.sdf
 PLACE_CLEARANCE       = 0.002   # small gap so it doesn't spawn interpenetrating
 
 # Table collision object (must match the table's <pose>/<size> in
@@ -213,6 +215,16 @@ PLACE_CLEARANCE       = 0.002   # small gap so it doesn't spawn interpenetrating
 # statically less likely to hit it.
 TABLE_SIZE = (0.5, 0.5, 0.05)
 TABLE_POSE = (0.65, 0.0, 0.475)
+
+# Cube collision object size (must match red_box's <size> in
+# pick_place.sdf). Its pose is read from Gazebo ground truth at startup
+# instead of hardcoded, same as the grasp target.
+CUBE_SIZE = (0.05, 0.05, 0.05)
+
+# Links allowed to touch the grasped cylinder once it is an attached
+# collision object; without this MoveIt would treat the gripper closing
+# around the cylinder as a collision and refuse to plan the grasp descent.
+GRIPPER_TOUCH_LINKS = ["fixed_finger", "moving_finger", "gripper_tcp"]
 
 
 class PickPlaceNode(Node):
@@ -290,6 +302,14 @@ class PickPlaceNode(Node):
         self._validity_client.wait_for_service()
         self.get_logger().info("Spline trajectory planning connected.")
 
+        # Reused for the startup scene setup below and later, mid-sequence,
+        # for attaching/detaching the grasped cylinder (see
+        # _attach_grasped_object / _detach_grasped_object).
+        self._planning_scene_client = self.create_client(
+            ApplyPlanningScene, "/apply_planning_scene", callback_group=self._client_group)
+        self.get_logger().info("Waiting for /apply_planning_scene service...")
+        self._planning_scene_client.wait_for_service()
+
         # ------------------------------------------------------------------
         # Gripper command publisher (drives the gz-sim JointPositionController
         # plugin on gripper_finger_joint directly, see gripper.xacro)
@@ -301,10 +321,10 @@ class PickPlaceNode(Node):
         self._attached_model = None
 
         # ------------------------------------------------------------------
-        # Planning scene: register the table so MoveIt actually plans around
-        # it instead of being unaware it exists.
+        # Planning scene: register the table, cube, and cylinder so MoveIt
+        # actually plans around them instead of being unaware they exist.
         # ------------------------------------------------------------------
-        self._add_table_collision_object()
+        self._add_scene_collision_objects()
 
         # ------------------------------------------------------------------
         # Subscriber
@@ -326,34 +346,69 @@ class PickPlaceNode(Node):
     # -----------------------------------------------------------------------
     # Planning scene setup
     # -----------------------------------------------------------------------
-    def _add_table_collision_object(self) -> None:
-        # Called from __init__, before the executor starts spinning, so the
-        # callback group assignment here does not affect re-entrancy safety
-        # (there is no concurrent spinning yet for it to interact with) —
-        # set for consistency with every other client in this node.
-        client = self.create_client(
-            ApplyPlanningScene, "/apply_planning_scene", callback_group=self._client_group)
-        self.get_logger().info("Waiting for /apply_planning_scene service...")
-        client.wait_for_service()
-
-        table = CollisionObject()
-        table.header.frame_id = ROBOT_BASE_FRAME
-        table.id = "table"
-        table.operation = CollisionObject.ADD
+    @staticmethod
+    def _box_collision_object(object_id: str, size, position) -> CollisionObject:
+        obj = CollisionObject()
+        obj.header.frame_id = ROBOT_BASE_FRAME
+        obj.id = object_id
+        obj.operation = CollisionObject.ADD
 
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
-        box.dimensions = list(TABLE_SIZE)
-        table.primitives.append(box)
+        box.dimensions = list(size)
+        obj.primitives.append(box)
 
-        box_pose = Pose()
-        box_pose.position.x, box_pose.position.y, box_pose.position.z = TABLE_POSE
-        box_pose.orientation.w = 1.0
-        table.primitive_poses.append(box_pose)
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = position
+        pose.orientation.w = 1.0
+        obj.primitive_poses.append(pose)
+        return obj
 
+    @staticmethod
+    def _cylinder_collision_object(object_id: str, radius: float, height: float, position) -> CollisionObject:
+        obj = CollisionObject()
+        obj.header.frame_id = ROBOT_BASE_FRAME
+        obj.id = object_id
+        obj.operation = CollisionObject.ADD
+
+        cylinder = SolidPrimitive()
+        cylinder.type = SolidPrimitive.CYLINDER
+        # SolidPrimitive.CYLINDER_HEIGHT == 0, SolidPrimitive.CYLINDER_RADIUS == 1
+        cylinder.dimensions = [height, radius]
+        obj.primitives.append(cylinder)
+
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = position
+        pose.orientation.w = 1.0  # SDF pose has no rotation, cylinder stands on its local Z same as here
+        obj.primitive_poses.append(pose)
+        return obj
+
+    def _add_scene_collision_objects(self) -> None:
         scene = PlanningScene()
         scene.is_diff = True
-        scene.world.collision_objects.append(table)
+        scene.world.collision_objects.append(
+            self._box_collision_object("table", TABLE_SIZE, TABLE_POSE))
+
+        cube_pose = self._get_model_pose(PLACE_TARGET_MODEL)
+        if cube_pose is not None:
+            scene.world.collision_objects.append(
+                self._box_collision_object(PLACE_TARGET_MODEL, CUBE_SIZE, cube_pose))
+        else:
+            self.get_logger().warn(
+                f"Could not read '{PLACE_TARGET_MODEL}' pose at startup; "
+                "it will not be registered as a collision object."
+            )
+
+        cylinder_pose = self._get_model_pose(GRASP_TARGET_MODEL)
+        if cylinder_pose is not None:
+            scene.world.collision_objects.append(
+                self._cylinder_collision_object(
+                    GRASP_TARGET_MODEL, CYLINDER_RADIUS, CYLINDER_HALF_LENGTH * 2, cylinder_pose))
+        else:
+            self.get_logger().warn(
+                f"Could not read '{GRASP_TARGET_MODEL}' pose at startup; "
+                "it will not be registered as a collision object."
+            )
 
         request = ApplyPlanningScene.Request()
         request.scene = scene
@@ -365,12 +420,68 @@ class PickPlaceNode(Node):
         # future does so from within a running callback instead, where that
         # would not be true; see _wait_for_future and the threading model
         # comment at the top of this file.
-        future = client.call_async(request)
+        future = self._planning_scene_client.call_async(request)
         rclpy.spin_until_future_complete(self, future)
         if future.result() is not None and future.result().success:
-            self.get_logger().info("Table added to the planning scene as a collision object.")
+            self.get_logger().info(
+                "Table, cube, and cylinder added to the planning scene as collision objects.")
         else:
-            self.get_logger().warn("Failed to add table to the planning scene.")
+            self.get_logger().warn("Failed to add scene collision objects.")
+
+    def _attach_grasped_object(self, object_id: str) -> None:
+        # Attaching an object MoveIt already knows about (by id) moves it
+        # from the world into the robot state; explicitly removing the
+        # world copy in the same diff avoids depending on every MoveIt
+        # version doing that move automatically, which is cheap insurance
+        # against the object silently existing in both places at once.
+        attached = AttachedCollisionObject()
+        attached.link_name = END_EFFECTOR
+        attached.object.id = object_id
+        attached.object.operation = CollisionObject.ADD
+        attached.touch_links = GRIPPER_TOUCH_LINKS
+
+        world_remove = CollisionObject()
+        world_remove.id = object_id
+        world_remove.header.frame_id = ROBOT_BASE_FRAME
+        world_remove.operation = CollisionObject.REMOVE
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.robot_state.is_diff = True
+        scene.robot_state.attached_collision_objects.append(attached)
+        scene.world.collision_objects.append(world_remove)
+        self._apply_planning_scene_diff(scene, f"attach {object_id} to {END_EFFECTOR}")
+
+    def _detach_grasped_object(self, object_id: str) -> None:
+        # Detach only; the object is not re-registered in the world. It was
+        # just released and physics takes over its resting pose from here,
+        # which this node has no way to know ahead of the next detection
+        # cycle. The arm's immediate retreat still has the PRE_GRASP_OFFSET
+        # margin for clearance.
+        detached = AttachedCollisionObject()
+        detached.link_name = END_EFFECTOR
+        detached.object.id = object_id
+        detached.object.operation = CollisionObject.REMOVE
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.robot_state.is_diff = True
+        scene.robot_state.attached_collision_objects.append(detached)
+        self._apply_planning_scene_diff(scene, f"detach {object_id} from {END_EFFECTOR}")
+
+    def _apply_planning_scene_diff(self, scene: PlanningScene, description: str) -> None:
+        # Called from within the running sequence (unlike
+        # _add_scene_collision_objects's startup call), so this uses
+        # _wait_for_future rather than rclpy.spin_until_future_complete —
+        # see the threading model comment at the top of this file.
+        request = ApplyPlanningScene.Request()
+        request.scene = scene
+        future = self._planning_scene_client.call_async(request)
+        result = self._wait_for_future(future)
+        if result is not None and result.success:
+            self.get_logger().info(f"Planning scene updated: {description}")
+        else:
+            self.get_logger().warn(f"Failed to update planning scene: {description}")
 
     # -----------------------------------------------------------------------
     # Callback
@@ -505,6 +616,7 @@ class PickPlaceNode(Node):
             if self._verify_grasp(GRASP_TARGET_MODEL):
                 with self._state_lock:
                     self._attached_model = GRASP_TARGET_MODEL
+                self._attach_grasped_object(GRASP_TARGET_MODEL)
                 self.get_logger().info(f"Object grasped: {GRASP_TARGET_MODEL}")
                 grasped = True
                 break
@@ -540,6 +652,7 @@ class PickPlaceNode(Node):
 
         self.get_logger().info("Step 7/8 — Releasing onto the cube...")
         self._send_gripper_command(GRIPPER_OPEN)
+        self._detach_grasped_object(GRASP_TARGET_MODEL)
         with self._state_lock:
             self._attached_model = None
 
