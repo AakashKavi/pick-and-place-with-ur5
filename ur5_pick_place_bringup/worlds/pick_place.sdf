@@ -153,7 +153,14 @@
     <!-- Pose: above table center, pitched down 90 deg (pi/2 rad). Height keeps
          camera-to-table-top clearance at 0.80 m (1.30 - 0.500), same as
          before (1.50 - 0.700), so the perception passthrough filter bounds
-         (tuned for that clearance) stay valid without re-tuning. -->
+         (tuned for that clearance) stay valid without re-tuning.
+         MUST MATCH the camera_x/camera_y/camera_z/camera_roll/camera_pitch/
+         camera_yaw launch argument defaults in sim.launch.py. gz-sim reads
+         this world file directly and has no way to consume a ROS2 launch
+         argument, so sim.launch.py's static transform publisher (the
+         source of truth pick_place_node.py's tf2 lookup actually uses) and
+         this <pose> are two independent copies of the same numbers that
+         have to be kept in sync by hand. -->
     <model name="depth_camera">
       <static>true</static>
       <pose>0.65 0 1.3 0 1.5708 0</pose>

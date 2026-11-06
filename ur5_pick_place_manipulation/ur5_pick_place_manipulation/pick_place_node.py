@@ -86,7 +86,7 @@ from std_msgs.msg import Float64
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 import tf2_ros
-import tf2_geometry_msgs  # registers PoseStamped with tf2
+import tf2_geometry_msgs  # do_transform_pose, and registers Pose types with tf2
 
 from scipy.interpolate import CubicSpline
 
@@ -108,11 +108,15 @@ END_EFFECTOR      = "gripper_tcp"   # fingertip midpoint, not the flange
 # base_link_inertia, or the arm reaches for the mirror-image target.
 ROBOT_BASE_FRAME  = "base_link"
 
-# Depth camera mount pose in world/base_link (must match the depth_camera
-# model's <pose> in pick_place.sdf and the camera_tf static transform in
-# sim.launch.py).
-CAMERA_X = 0.65
-CAMERA_Z = 1.30
+# The camera's mount pose used to be duplicated here as CAMERA_X/CAMERA_Z
+# constants, hand-kept in sync with sim.launch.py's camera_tf static
+# transform and pick_place.sdf's depth_camera <pose>. It no longer is:
+# sim.launch.py is now the single source of truth for that pose (see its
+# camera_x/.../camera_yaw launch arguments), publishes it as the real
+# base_link -> depth_camera/link/depth_camera transform, and this node
+# looks that transform up via tf2 instead (see objects_callback). The SDF
+# still has its own copy of the same numbers, since gz-sim reads the world
+# file independently of ROS2 TF, with a comment there that it must match.
 WORLD_FRAME       = "world"
 PRE_GRASP_OFFSET  = 0.10     # metres above object in z (robot base frame)
 PLANNING_TIME     = 10.0
@@ -371,10 +375,27 @@ class PickPlaceNode(Node):
         # top surface, never its center, so the detected Z is biased high
         # by roughly the object's own half-height: enough to make the
         # gripper close above the cylinder's body instead of around it.
+        #
+        # msg.poses are in the camera's own optical frame (msg.header
+        # matches the source point cloud's header). Look the camera's
+        # transform into ROBOT_BASE_FRAME up once via tf2 rather than the
+        # hand-written axis remapping this used to do, so the camera mount
+        # pose only has to be correct in one place: sim.launch.py's
+        # camera_tf static transform publisher.
+        try:
+            camera_to_base = self.tf_buffer.lookup_transform(
+                ROBOT_BASE_FRAME, msg.header.frame_id, rclpy.time.Time()
+            )
+        except tf2_ros.TransformException as ex:
+            self.get_logger().warn(
+                f"Could not look up {msg.header.frame_id} -> {ROBOT_BASE_FRAME}: {ex}")
+            return
+
         best_dist = GRASP_MATCH_RADIUS
         seen = False
         for cam in msg.poses:
-            x, y, z = self._camera_pose_to_robot(cam)
+            base_pose = tf2_geometry_msgs.do_transform_pose(cam, camera_to_base)
+            x, y, z = base_pose.position.x, base_pose.position.y, base_pose.position.z
             dist = ((x - cylinder_gt[0]) ** 2
                     + (y - cylinder_gt[1]) ** 2
                     + (z - cylinder_gt[2]) ** 2) ** 0.5
@@ -414,18 +435,6 @@ class PickPlaceNode(Node):
         finally:
             with self._state_lock:
                 self.is_executing = False
-
-    @staticmethod
-    def _camera_pose_to_robot(cam: Pose):
-        # Camera is mounted at world/base_link (CAMERA_X, 0, CAMERA_Z), pitched
-        # 90deg down, in the camera's optical frame convention (Z forward,
-        # X right, Y down). That maps: optical Z -> base +X, optical X ->
-        # base -Z, optical Y -> base +Y (unchanged, no flip).
-        return (
-            cam.position.z + CAMERA_X,
-            cam.position.y,
-            -cam.position.x + CAMERA_Z,
-        )
 
     @staticmethod
     def _down_orientation() -> Quaternion:
