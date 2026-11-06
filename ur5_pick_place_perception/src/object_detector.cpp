@@ -20,8 +20,19 @@ ObjectDetectorNode::ObjectDetectorNode()
   this->declare_parameter("cluster_tolerance",      0.02);
   this->declare_parameter("min_cluster_size",        50);
   this->declare_parameter("max_cluster_size",      25000);
-  this->declare_parameter("passthrough_min_z",      0.55);
-  this->declare_parameter("passthrough_max_z",      0.79);
+  // passthrough_axis is "x" by default, not the z-axis its old name implied.
+  // The gz-sim depth_camera sensor used here publishes PointCloud2 with the
+  // optical-frame x field carrying depth (distance from the camera along its
+  // view direction), not the z field a ROS REP-103 optical frame would
+  // suggest. Confirmed empirically (see git history: "fix: correct
+  // passthrough filter axis to x for depth filtering") and by the numbers
+  // matching pick_place.sdf's camera-to-table-top distance (0.80 m) against
+  // these bounds. If this node is ever pointed at a different depth source
+  // that publishes a standard optical-frame cloud, this parameter is the
+  // one to change, not the filter logic.
+  this->declare_parameter("passthrough_min",        0.55);
+  this->declare_parameter("passthrough_max",        0.79);
+  this->declare_parameter("passthrough_axis",       std::string("x"));
   this->declare_parameter("voxel_leaf_size",        0.01);
   this->declare_parameter("plane_distance_threshold", 0.01);
   this->declare_parameter("enable_plane_removal", false);
@@ -29,8 +40,9 @@ ObjectDetectorNode::ObjectDetectorNode()
   cluster_tolerance_        = this->get_parameter("cluster_tolerance").as_double();
   min_cluster_size_         = this->get_parameter("min_cluster_size").as_int();
   max_cluster_size_         = this->get_parameter("max_cluster_size").as_int();
-  passthrough_min_z_        = this->get_parameter("passthrough_min_z").as_double();
-  passthrough_max_z_        = this->get_parameter("passthrough_max_z").as_double();
+  passthrough_min_          = this->get_parameter("passthrough_min").as_double();
+  passthrough_max_          = this->get_parameter("passthrough_max").as_double();
+  passthrough_axis_         = this->get_parameter("passthrough_axis").as_string();
   voxel_leaf_size_          = this->get_parameter("voxel_leaf_size").as_double();
   plane_distance_threshold_ = this->get_parameter("plane_distance_threshold").as_double();
   enable_plane_removal_     = this->get_parameter("enable_plane_removal").as_bool();
@@ -118,14 +130,19 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr ObjectDetectorNode::downsample(
 //
 // We only care about the region directly above the table. Anything too close
 // to the camera or too far below is noise we can safely discard.
+//
+// passthrough_axis_ is the depth axis of the incoming cloud, not
+// necessarily the ROS REP-103 optical convention's z. For this node's gz-sim
+// depth_camera source it is "x" (see the passthrough_axis parameter comment
+// in the constructor).
 // ---------------------------------------------------------------------------
 pcl::PointCloud<pcl::PointXYZ>::Ptr ObjectDetectorNode::passthroughFilter(
   const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud)
 {
   pcl::PassThrough<pcl::PointXYZ> pass;
   pass.setInputCloud(cloud);
-  pass.setFilterFieldName("x");
-  pass.setFilterLimits(passthrough_min_z_, passthrough_max_z_);
+  pass.setFilterFieldName(passthrough_axis_);
+  pass.setFilterLimits(passthrough_min_, passthrough_max_);
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>);
   pass.filter(*out);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
@@ -47,8 +49,9 @@ private:
   double cluster_tolerance_;
   int min_cluster_size_;
   int max_cluster_size_;
-  double passthrough_min_z_;
-  double passthrough_max_z_;
+  double passthrough_min_;
+  double passthrough_max_;
+  std::string passthrough_axis_;
   double voxel_leaf_size_;
   double plane_distance_threshold_;
   bool enable_plane_removal_;
