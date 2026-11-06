@@ -18,8 +18,13 @@
 #
 # Prints a single PASS or FAIL as the last line of stdout. Everything else
 # goes to test_logs/<timestamp>/.
-
-set -u
+#
+# Deliberately does NOT use "set -u": ROS2's own setup.bash (both the
+# Humble install and the workspace install/setup.bash overlay) references
+# variables such as AMENT_TRACE_SETUP_FILES that are legitimately unset on
+# first source, and nounset mode turns that into a fatal error before the
+# script even reaches the build step. Unset-variable bugs in this script's
+# own logic are caught by code review instead.
 
 WS_DIR="/home/aakash/ros2_ws"
 REPO_DIR="/home/aakash/ros2_ws/src/ros2_ur5_vision_grasp"
