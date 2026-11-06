@@ -239,6 +239,10 @@ CYLINDER_HALF_LENGTH  = 0.030   # blue_cylinder: length 0.06
 CYLINDER_RADIUS        = 0.025   # blue_cylinder radius, see pick_place.sdf
 PLACE_CLEARANCE       = 0.002   # small gap so it doesn't spawn interpenetrating
 
+# Threshold used by the placement verification at the end of the sequence,
+# same value scripts/run_sim_test.sh checks against from outside the node.
+PLACEMENT_POSE_TOLERANCE = 0.03   # metres, dx and dy against the cube
+
 # Table collision object (must match the table's <pose>/<size> in
 # pick_place.sdf) so MoveIt actually plans around it instead of just being
 # statically less likely to hit it.
@@ -718,7 +722,33 @@ class PickPlaceNode(Node):
 
         with self._state_lock:
             self._done = True
-        self.get_logger().info("Pick-and-place complete: cylinder placed on the cube!")
+
+        # Verify against the cached ground truth instead of assuming the
+        # sequence finishing means the cylinder actually landed correctly.
+        cylinder_final = self._get_model_pose(GRASP_TARGET_MODEL)
+        cube_final = self._get_model_pose(PLACE_TARGET_MODEL)
+        if cylinder_final is not None and cube_final is not None:
+            dx = abs(cylinder_final[0] - cube_final[0])
+            dy = abs(cylinder_final[1] - cube_final[1])
+            z = cylinder_final[2]
+            placed_correctly = (
+                dx <= PLACEMENT_POSE_TOLERANCE
+                and dy <= PLACEMENT_POSE_TOLERANCE
+                and z > cube_final[2] + CUBE_HALF_HEIGHT
+            )
+        else:
+            dx = dy = z = float("nan")
+            placed_correctly = False
+
+        if placed_correctly:
+            self.get_logger().info(
+                f"Placement verified: dx={dx:.4f} dy={dy:.4f} z={z:.4f}"
+            )
+            self.get_logger().info("Pick-and-place complete: cylinder placed on the cube!")
+        else:
+            self.get_logger().error(
+                f"Placement FAILED: dx={dx:.4f} dy={dy:.4f} z={z:.4f}"
+            )
 
     # -----------------------------------------------------------------------
     # Gripper control
