@@ -108,7 +108,7 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 import tf2_ros
 import tf2_geometry_msgs  # do_transform_pose, and registers Pose types with tf2
 
-from scipy.interpolate import CubicSpline
+from ur5_pick_place_manipulation import motion_math
 
 import copy
 import math
@@ -640,7 +640,8 @@ class PickPlaceNode(Node):
         place_pose = Pose()
         place_pose.position.x = place_xyz[0]
         place_pose.position.y = place_xyz[1]
-        place_pose.position.z = place_xyz[2] + CUBE_HALF_HEIGHT + CYLINDER_HALF_LENGTH + PLACE_CLEARANCE
+        place_pose.position.z = motion_math.compute_place_height(
+            place_xyz[2], CUBE_HALF_HEIGHT, CYLINDER_HALF_LENGTH, PLACE_CLEARANCE)
         place_pose.orientation = self._down_orientation()
 
         grasp_pose.orientation = self._down_orientation()
@@ -938,35 +939,15 @@ class PickPlaceNode(Node):
 
     @staticmethod
     def _spline_duration(start: list, goal: list) -> float:
-        # Duration long enough that a per-joint cubic spline (zero velocity
-        # at both ends) from start to goal stays within MAX_JOINT_VELOCITY
-        # and MAX_JOINT_ACCEL, with a MIN_SPLINE_DURATION floor.
-        #
-        # For a single cubic segment clamped to zero velocity at both ends,
-        # peak velocity = 1.5 * displacement / T (standard result for this
-        # boundary condition), which gives a first estimate of T from the
-        # velocity budget alone. That estimate is not just trusted for
-        # acceleration too: a trial spline is built at that duration and
-        # its actual second derivative is sampled, since what matters is
-        # what the spline really does, not just the analytical formula.
-        # Acceleration scales as 1/T^2 for a fixed displacement, so if the
-        # sampled peak exceeds the budget, this scales T up by exactly the
-        # factor needed rather than guessing and re-checking.
-        max_disp = max(abs(g - s) for s, g in zip(start, goal))
-        duration = max(MIN_SPLINE_DURATION, 1.5 * max_disp / MAX_JOINT_VELOCITY)
-
-        trial_splines = [
-            CubicSpline([0.0, duration], [s, g], bc_type=((1, 0.0), (1, 0.0)))
-            for s, g in zip(start, goal)
-        ]
-        sample_times = [duration * i / 100.0 for i in range(101)]
-        peak_accel = max(
-            abs(spline(t, 2)) for spline in trial_splines for t in sample_times
-        )
-        if peak_accel > MAX_JOINT_ACCEL:
-            duration *= (peak_accel / MAX_JOINT_ACCEL) ** 0.5
-
-        return max(duration, MIN_SPLINE_DURATION)
+        # See motion_math.spline_duration's docstring for the reasoning
+        # (velocity-derived first estimate, verified and if necessary
+        # lengthened against the spline's own sampled acceleration). Moved
+        # there, out of this ROS node class, specifically so it can be unit
+        # tested without ROS running (test/test_motion_math.py); this stays
+        # as a thin wrapper binding this node's actual velocity/accel/floor
+        # constants.
+        return motion_math.spline_duration(
+            start, goal, MAX_JOINT_VELOCITY, MAX_JOINT_ACCEL, MIN_SPLINE_DURATION)
 
     @staticmethod
     def _build_spline_trajectory(start: list, goal: list) -> RobotTrajectory:
@@ -977,20 +958,19 @@ class PickPlaceNode(Node):
         # _spline_duration) instead of a fixed constant, so a small move
         # finishes quickly and a large one still respects the
         # velocity/acceleration budget rather than silently exceeding it.
+        # The actual sampling is motion_math.build_spline_samples (pure,
+        # unit tested separately); this method's own job is just wrapping
+        # those samples into the ROS RobotTrajectory message type.
         duration = PickPlaceNode._spline_duration(start, goal)
-        splines = [
-            CubicSpline([0.0, duration], [s, g], bc_type=((1, 0.0), (1, 0.0)))
-            for s, g in zip(start, goal)
-        ]
+        samples = motion_math.build_spline_samples(start, goal, duration, SPLINE_STEPS)
 
         trajectory = RobotTrajectory()
         trajectory.joint_trajectory.joint_names = list(ARM_JOINT_NAMES)
-        for i in range(SPLINE_STEPS + 1):
-            t = duration * i / SPLINE_STEPS
+        for t, positions, velocities, accelerations in samples:
             point = JointTrajectoryPoint()
-            point.positions = [float(s(t)) for s in splines]
-            point.velocities = [float(s(t, 1)) for s in splines]
-            point.accelerations = [float(s(t, 2)) for s in splines]
+            point.positions = positions
+            point.velocities = velocities
+            point.accelerations = accelerations
             point.time_from_start.sec = int(t)
             point.time_from_start.nanosec = int(round((t - int(t)) * 1e9))
             trajectory.joint_trajectory.points.append(point)
@@ -998,10 +978,7 @@ class PickPlaceNode(Node):
 
     @staticmethod
     def _path_length(start: list, goal: list) -> float:
-        # Straight-line distance in joint space (radians), unweighted
-        # across joints — same simple convention _spline_duration's
-        # max_disp already uses, not a true spline arc length.
-        return math.sqrt(sum((g - s) ** 2 for s, g in zip(start, goal)))
+        return motion_math.path_length(start, goal)
 
     def _trajectory_is_valid(self, trajectory: RobotTrajectory, num_checks: int) -> bool:
         # Bypassing OMPL for spline moves also bypasses its collision

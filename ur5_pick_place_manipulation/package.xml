@@ -26,6 +26,8 @@
   <depend>ros_gz_interfaces</depend>
   <depend>python3-scipy</depend>
 
+  <test_depend>python3-pytest</test_depend>
+
   <export>
     <build_type>ament_python</build_type>
   </export>
