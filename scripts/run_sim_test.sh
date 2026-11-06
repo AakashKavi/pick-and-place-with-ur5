@@ -55,20 +55,43 @@ log() {
 }
 
 cleanup() {
+  # Killing by process group (kill -- -PID) is NOT enough here: gz-sim's own
+  # launcher (ign gazebo -> "ign gazebo server" / "ign gazebo gui") puts
+  # those two processes into their OWN process group, detached from the
+  # group this script's setsid created, so a process-group kill of the
+  # setsid'd leader never reaches them. Confirmed by hand: three earlier
+  # test runs each left an orphaned gz-sim server+gui pair running
+  # indefinitely (one for 36+ minutes) after this function reported
+  # cleanup done, which went unnoticed until system load hit ~23 on an
+  # 8-thread machine. What DOES stay constant is the session ID: setsid
+  # makes SIM_PID/PP_PID both the PID and the SID of everything launched
+  # under them, and gz-sim's server/gui change their process group but not
+  # their session. So kill by session (pkill -s), not by process group.
   log "Cleanup: stopping everything this script started."
   for pid in "${PP_PID}" "${SIM_PID}"; do
-    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-      log "Sending SIGTERM to process group ${pid}"
-      kill -TERM -- "-${pid}" 2>/dev/null
+    if [ -n "${pid}" ]; then
+      log "Sending SIGTERM to session ${pid}"
+      pkill -TERM -s "${pid}" 2>/dev/null
+      kill -TERM -- "-${pid}" 2>/dev/null   # also try the process group, cheap and harmless
     fi
   done
   sleep 5
   for pid in "${PP_PID}" "${SIM_PID}"; do
-    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-      log "Process group ${pid} still alive, sending SIGKILL"
+    if [ -n "${pid}" ]; then
+      log "Sending SIGKILL to session ${pid} (in case anything is still alive)"
+      pkill -KILL -s "${pid}" 2>/dev/null
       kill -KILL -- "-${pid}" 2>/dev/null
     fi
   done
+  sleep 1
+  if [ -n "${SIM_PID}" ] || [ -n "${PP_PID}" ]; then
+    local sids="${SIM_PID:-0},${PP_PID:-0}"
+    local leftover
+    leftover="$(pgrep -s "${sids}" 2>/dev/null)"
+    if [ -n "${leftover}" ]; then
+      log "WARNING: processes still alive after cleanup, check manually: ${leftover}"
+    fi
+  fi
   log "Cleanup done."
 }
 trap cleanup EXIT INT TERM

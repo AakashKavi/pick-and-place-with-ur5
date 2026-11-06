@@ -36,23 +36,39 @@ a separate Python threading.Thread and busy-polling future.done() from
 there, which works but needed its own re-entrancy reasoning and left the
 default executor's single thread otherwise unused.
 
-This version instead uses a MultiThreadedExecutor with two callback groups:
+This version instead uses a MultiThreadedExecutor with three callback
+groups:
   - _sequence_group (MutuallyExclusiveCallbackGroup): owns the
     /detected_objects subscription. Only one callback from this group runs
     at a time, so the 8-step sequence still cannot be re-entered by a
     second detection while it is running, same guarantee the is_executing
     flag gave before, now enforced by rclpy itself rather than by hand.
-  - _client_group (ReentrantCallbackGroup): owns every action client,
-    service client, and the /joint_states subscription. Callbacks in a
-    Reentrant group can run concurrently with each other and with
-    callbacks from other groups, on other threads from the executor's pool.
+  - _client_group (ReentrantCallbackGroup): owns every action client and
+    service client. Callbacks in a Reentrant group can run concurrently
+    with each other and with callbacks from other groups, on other threads
+    from the executor's pool.
+  - _joint_state_group (ReentrantCallbackGroup): owns only the
+    /joint_states subscription, separately from _client_group. First
+    version of this change put /joint_states in _client_group too, and
+    testing against the real simulator (not just reasoning about it) showed
+    that was wrong: under sustained action/service traffic, every thread
+    could end up busy processing _client_group callbacks back to back, and
+    /joint_states callbacks — competing for the same pool, with no
+    priority over anything else — lost out indefinitely. The node spun for
+    the full 420s test timeout always reporting "No current joint state
+    yet", never once having received a single /joint_states message, which
+    cascaded into every spline move falling back to the slower,
+    collision-checked joint-space planner and that in turn timing out
+    (MoveIt error -4) under planning_time pressure. Giving /joint_states
+    its own group means it is never waiting behind action/service work for
+    a thread.
 
 Because the sequence now runs on its own executor thread (from
 _sequence_group) and the action/service results are delivered by other
-executor threads (from _client_group), blocking or polling inside the
-sequence no longer starves anything: a different thread is free to process
-the result while this one waits. _wait_for_future below still polls
-future.done() in a short sleep loop rather than calling
+executor threads (from _client_group / _joint_state_group), blocking or
+polling inside the sequence no longer starves anything: a different thread
+is free to process the result while this one waits. _wait_for_future below
+still polls future.done() in a short sleep loop rather than calling
 rclpy.spin_until_future_complete from inside the callback; that avoids
 re-entering the executor's own spin machinery altogether, which keeps the
 reasoning simple regardless of how many threads the executor has.
@@ -208,12 +224,16 @@ class PickPlaceNode(Node):
         # Callback groups — see the threading model comment at the top of
         # this file. _sequence_group serializes the pick-and-place sequence
         # (one callback, mutually exclusive with itself); _client_group lets
-        # every action/service client and the joint state subscription be
-        # serviced concurrently, on other executor threads, while the
-        # sequence callback is blocked waiting on one of them.
+        # every action/service client be serviced concurrently, on other
+        # executor threads, while the sequence callback is blocked waiting
+        # on one of them; _joint_state_group is separate from _client_group
+        # so /joint_states is never starved by action/service traffic
+        # (confirmed against the real simulator that sharing one group for
+        # both was not safe, see the top-of-file comment).
         # ------------------------------------------------------------------
         self._sequence_group = MutuallyExclusiveCallbackGroup()
         self._client_group = ReentrantCallbackGroup()
+        self._joint_state_group = ReentrantCallbackGroup()
 
         # Guards is_executing, _done, _attached_model: read from the
         # sequence callback's thread and worth protecting defensively even
@@ -262,7 +282,7 @@ class PickPlaceNode(Node):
         self._latest_joint_state = None
         self.create_subscription(
             JointState, "/joint_states", self._joint_state_cb, 10,
-            callback_group=self._client_group)
+            callback_group=self._joint_state_group)
 
         self._validity_client = self.create_client(
             GetStateValidity, "/check_state_validity", callback_group=self._client_group)
@@ -960,13 +980,20 @@ class PickPlaceNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = PickPlaceNode()
-    # 4 threads: one is effectively reserved for the sequence callback
+    # 8 threads: one is effectively reserved for the sequence callback
     # (_sequence_group only ever runs one callback at a time regardless of
-    # how many threads are available), the rest service _client_group
-    # (action/service results, /joint_states) concurrently while the
-    # sequence is blocked. See the threading model comment at the top of
-    # this file for why this replaces the previous worker-thread approach.
-    executor = MultiThreadedExecutor(num_threads=4)
+    # how many threads are available), one is effectively reserved for
+    # /joint_states (_joint_state_group is otherwise empty), the rest
+    # service _client_group (action/service results) concurrently while the
+    # sequence is blocked. 4 threads total was tried first and was not
+    # enough: under sustained action/service load every thread ended up
+    # busy with _client_group work and /joint_states starved for the full
+    # length of a test run (see the threading model comment at the top of
+    # this file for what that looked like). This node is I/O-bound, not
+    # CPU-bound — almost every thread spends nearly all its time blocked on
+    # a future or a sleep, not computing — so more threads than this
+    # machine's 8 cores is still reasonable headroom, not wasted resources.
+    executor = MultiThreadedExecutor(num_threads=8)
     executor.add_node(node)
     try:
         executor.spin()
