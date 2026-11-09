@@ -16,11 +16,73 @@ Pick-and-place sequence:
   6. Descend to PLACE pose (resting on top of the cube)
   7. Open gripper
   8. Retreat and return to HOME joint configuration
+
+-------------------------------------------------------------------------------
+Threading model
+-------------------------------------------------------------------------------
+This node blocks on action and service futures (send a goal, wait for the
+result) in the middle of what is, structurally, a single long-running ROS2
+callback: the /detected_objects subscription callback kicks off the whole
+8-step sequence and does not return until it finishes.
+
+Earlier version of this file: that callback ran under rclpy.spin(node),
+which is a SingleThreadedExecutor with exactly one spin thread. Blocking
+that one thread inside the callback is fatal, because the action/service
+result also has to be delivered BY that same thread's spin loop: the
+result future can never complete, the blocking call never returns, and the
+one thread that could dispatch the result is the one thread stuck waiting
+for it. That earlier version worked around this by running the sequence on
+a separate Python threading.Thread and busy-polling future.done() from
+there, which works but needed its own re-entrancy reasoning and left the
+default executor's single thread otherwise unused.
+
+This version instead uses a MultiThreadedExecutor with three callback
+groups:
+  - _sequence_group (MutuallyExclusiveCallbackGroup): owns the
+    /detected_objects subscription. Only one callback from this group runs
+    at a time, so the 8-step sequence still cannot be re-entered by a
+    second detection while it is running, same guarantee the is_executing
+    flag gave before, now enforced by rclpy itself rather than by hand.
+  - _client_group (ReentrantCallbackGroup): owns every action client and
+    service client. Callbacks in a Reentrant group can run concurrently
+    with each other and with callbacks from other groups, on other threads
+    from the executor's pool.
+  - _joint_state_group (ReentrantCallbackGroup): owns only the
+    /joint_states subscription, separately from _client_group. First
+    version of this change put /joint_states in _client_group too. A test
+    run against the real simulator then showed every spline move falling
+    back to the slower, collision-checked joint-space planner and timing
+    out (MoveIt error -4), with the node reporting "No current joint state
+    yet" throughout. At the time this looked like thread starvation under
+    sustained action/service traffic, and this separate group plus raising
+    num_threads from 4 to 8 was the fix made for it. A later, genuinely
+    clean rerun (nothing else competing for CPU) completed normally with
+    none of those symptoms, which pointed at the real cause instead: three
+    earlier test runs had each left an orphaned Gazebo instance running
+    (a bug in the test script's own cleanup, not in this node), and the
+    failing run had been sharing the machine with all of them. The
+    starvation explanation was never actually confirmed, only guessed at
+    before the real cause was found. This separate group and num_threads=8
+    are kept anyway as a reasonable defensive choice, not because they were
+    shown to be necessary. Full account in DECISIONS.md.
+
+Because the sequence now runs on its own executor thread (from
+_sequence_group) and the action/service results are delivered by other
+executor threads (from _client_group / _joint_state_group), blocking or
+polling inside the sequence no longer starves anything: a different thread
+is free to process the result while this one waits. _wait_for_future below
+still polls future.done() in a short sleep loop rather than calling
+rclpy.spin_until_future_complete from inside the callback; that avoids
+re-entering the executor's own spin machinery altogether, which keeps the
+reasoning simple regardless of how many threads the executor has.
+-------------------------------------------------------------------------------
 """
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 
 from geometry_msgs.msg import PoseArray, Pose, Quaternion
 from moveit_msgs.action import MoveGroup, ExecuteTrajectory
@@ -33,22 +95,26 @@ from moveit_msgs.msg import (
     BoundingVolume,
     JointConstraint,
     CollisionObject,
+    AttachedCollisionObject,
     PlanningScene,
     RobotTrajectory,
 )
 from moveit_msgs.srv import ApplyPlanningScene, GetCartesianPath, GetStateValidity
+from ros_gz_interfaces.msg import Entity
+from ros_gz_interfaces.srv import SetEntityPose
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Float64
+from tf2_msgs.msg import TFMessage
 from trajectory_msgs.msg import JointTrajectoryPoint
 
 import tf2_ros
-import tf2_geometry_msgs  # registers PoseStamped with tf2
+import tf2_geometry_msgs  # do_transform_pose, and registers Pose types with tf2
 
-from scipy.interpolate import CubicSpline
+from ur5_pick_place_manipulation import motion_math
 
 import copy
-import subprocess
+import math
 import threading
 import time
 
@@ -65,11 +131,15 @@ END_EFFECTOR      = "gripper_tcp"   # fingertip midpoint, not the flange
 # base_link_inertia, or the arm reaches for the mirror-image target.
 ROBOT_BASE_FRAME  = "base_link"
 
-# Depth camera mount pose in world/base_link (must match the depth_camera
-# model's <pose> in pick_place.sdf and the camera_tf static transform in
-# sim.launch.py).
-CAMERA_X = 0.65
-CAMERA_Z = 1.30
+# The camera's mount pose used to be duplicated here as CAMERA_X/CAMERA_Z
+# constants, hand-kept in sync with sim.launch.py's camera_tf static
+# transform and pick_place.sdf's depth_camera <pose>. It no longer is:
+# sim.launch.py is now the single source of truth for that pose (see its
+# camera_x/.../camera_yaw launch arguments), publishes it as the real
+# base_link -> depth_camera/link/depth_camera transform, and this node
+# looks that transform up via tf2 instead (see objects_callback). The SDF
+# still has its own copy of the same numbers, since gz-sim reads the world
+# file independently of ROS2 TF, with a comment there that it must match.
 WORLD_FRAME       = "world"
 PRE_GRASP_OFFSET  = 0.10     # metres above object in z (robot base frame)
 PLANNING_TIME     = 10.0
@@ -111,14 +181,40 @@ ARM_JOINT_NAMES = [
     "wrist_3_joint",
 ]
 HOME_JOINT_VALUES = [0.0, -1.5708, 0.0, -1.5708, 0.0, 0.0]
-SPLINE_DURATION = 4.0   # seconds
+
+# Per-joint velocity/acceleration budget for the spline, scaled by the same
+# MAX_VELOCITY/MAX_ACCEL factors the OMPL-planned moves use, so a spline
+# move is not faster than a planned one would be for the same displacement.
+# Source values: UR5e's max_velocity is a uniform pi rad/s (180 deg/s) for
+# every joint (/opt/ros/humble/share/ur_description/config/ur5e/
+# joint_limits.yaml); max_acceleration is 5.0 rad/s^2 for every joint, set
+# by this project's own moveit_config override
+# (ur5_pick_place_moveit_config/config/joint_limits.yaml), since the base
+# URDF does not publish acceleration limits at all.
+MAX_JOINT_VELOCITY = 3.14159265 * MAX_VELOCITY   # rad/s
+MAX_JOINT_ACCEL     = 5.0 * MAX_ACCEL              # rad/s^2
+MIN_SPLINE_DURATION = 1.0   # seconds; floor so a tiny displacement does not
+                             # get an unreasonably short, jerky trajectory
 SPLINE_STEPS    = 40    # trajectory points sampled along the spline
+
+# Spacing (in combined joint-space distance, radians) targeted between
+# /check_state_validity calls along a spline move — see
+# _move_spline_to_joints and _trajectory_is_valid. A longer move gets
+# proportionally more checks instead of every move getting the same fixed
+# count regardless of how far it travels. Smaller spacing catches thinner
+# obstacles at the cost of more service calls per move; this value is not
+# derived from anything physical, it is a judgment call between those two.
+VALIDITY_CHECK_SPACING = 0.05   # rad
+MIN_VALIDITY_CHECKS = 5          # floor so a tiny move still gets checked
 
 # Gripper (see ur5_pick_place_description/urdf/gripper.xacro for the joint
 # limits these correspond to)
 GRIPPER_OPEN      = 0.0
 GRIPPER_CLOSED    = -0.018
-GRIPPER_MOVE_TIME = 0.5   # seconds given to the gz JointPositionController to get there
+GRIPPER_JOINT_NAME = "gripper_finger_joint"
+GRIPPER_POSITION_TOLERANCE = 0.001   # metres
+GRIPPER_WAIT_TIMEOUT = 2.0            # seconds before giving up and continuing anyway
+GRIPPER_WAIT_POLL_INTERVAL = 0.02     # seconds
 
 # Kinematic-attach bookkeeping.
 GZ_WORLD_NAME       = "pick_place_world"
@@ -143,7 +239,12 @@ PLACE_TARGET_MODEL   = "red_box"
 # centered on top of the cube: place_z = cube_z + half_cube + half_cylinder.
 CUBE_HALF_HEIGHT      = 0.025   # red_box: 0.05 cube
 CYLINDER_HALF_LENGTH  = 0.030   # blue_cylinder: length 0.06
+CYLINDER_RADIUS        = 0.025   # blue_cylinder radius, see pick_place.sdf
 PLACE_CLEARANCE       = 0.002   # small gap so it doesn't spawn interpenetrating
+
+# Threshold used by the placement verification at the end of the sequence,
+# same value scripts/run_sim_test.sh checks against from outside the node.
+PLACEMENT_POSE_TOLERANCE = 0.03   # metres, dx and dy against the cube
 
 # Table collision object (must match the table's <pose>/<size> in
 # pick_place.sdf) so MoveIt actually plans around it instead of just being
@@ -151,11 +252,43 @@ PLACE_CLEARANCE       = 0.002   # small gap so it doesn't spawn interpenetrating
 TABLE_SIZE = (0.5, 0.5, 0.05)
 TABLE_POSE = (0.65, 0.0, 0.475)
 
+# Cube collision object size (must match red_box's <size> in
+# pick_place.sdf). Its pose is read from Gazebo ground truth at startup
+# instead of hardcoded, same as the grasp target.
+CUBE_SIZE = (0.05, 0.05, 0.05)
+
+# Links allowed to touch the grasped cylinder once it is an attached
+# collision object; without this MoveIt would treat the gripper closing
+# around the cylinder as a collision and refuse to plan the grasp descent.
+GRIPPER_TOUCH_LINKS = ["fixed_finger", "moving_finger", "gripper_tcp"]
+
 
 class PickPlaceNode(Node):
 
     def __init__(self):
         super().__init__("pick_place_node")
+
+        # ------------------------------------------------------------------
+        # Callback groups, see the threading model comment at the top of
+        # this file. _sequence_group serializes the pick and place sequence
+        # (one callback, mutually exclusive with itself). _client_group lets
+        # every action and service client be serviced concurrently, on other
+        # executor threads, while the sequence callback is blocked waiting
+        # on one of them. _joint_state_group is separate from _client_group
+        # as a defensive choice, kept apart so /joint_states is never
+        # waiting behind action/service traffic for a thread, even though
+        # that was never actually shown to be necessary, see the
+        # top-of-file comment and DECISIONS.md for the full story.
+        # ------------------------------------------------------------------
+        self._sequence_group = MutuallyExclusiveCallbackGroup()
+        self._client_group = ReentrantCallbackGroup()
+        self._joint_state_group = ReentrantCallbackGroup()
+
+        # Guards is_executing, _done, _attached_model: read from the
+        # sequence callback's thread and worth protecting defensively even
+        # though _sequence_group already prevents that callback from
+        # running concurrently with itself.
+        self._state_lock = threading.Lock()
 
         # ------------------------------------------------------------------
         # TF2 buffer and listener
@@ -166,7 +299,8 @@ class PickPlaceNode(Node):
         # ------------------------------------------------------------------
         # MoveGroup action client
         # ------------------------------------------------------------------
-        self._action_client = ActionClient(self, MoveGroup, "/move_action")
+        self._action_client = ActionClient(
+            self, MoveGroup, "/move_action", callback_group=self._client_group)
         self.get_logger().info("Waiting for MoveGroup action server...")
         self._action_client.wait_for_server()
         self.get_logger().info("MoveGroup action server connected.")
@@ -175,11 +309,13 @@ class PickPlaceNode(Node):
         # Cartesian path planning + execution, for short local moves
         # (descend/retreat) — see CARTESIAN_* constants for why.
         # ------------------------------------------------------------------
-        self._cartesian_client = self.create_client(GetCartesianPath, "/compute_cartesian_path")
+        self._cartesian_client = self.create_client(
+            GetCartesianPath, "/compute_cartesian_path", callback_group=self._client_group)
         self.get_logger().info("Waiting for /compute_cartesian_path service...")
         self._cartesian_client.wait_for_service()
 
-        self._execute_client = ActionClient(self, ExecuteTrajectory, "/execute_trajectory")
+        self._execute_client = ActionClient(
+            self, ExecuteTrajectory, "/execute_trajectory", callback_group=self._client_group)
         self.get_logger().info("Waiting for ExecuteTrajectory action server...")
         self._execute_client.wait_for_server()
         self.get_logger().info("Cartesian path planning connected.")
@@ -193,12 +329,40 @@ class PickPlaceNode(Node):
         # dedicated IK service — see _resolve_goal_joints for why.
         # ------------------------------------------------------------------
         self._latest_joint_state = None
-        self.create_subscription(JointState, "/joint_states", self._joint_state_cb, 10)
+        self.create_subscription(
+            JointState, "/joint_states", self._joint_state_cb, 10,
+            callback_group=self._joint_state_group)
 
-        self._validity_client = self.create_client(GetStateValidity, "/check_state_validity")
+        self._validity_client = self.create_client(
+            GetStateValidity, "/check_state_validity", callback_group=self._client_group)
         self.get_logger().info("Waiting for /check_state_validity service...")
         self._validity_client.wait_for_service()
         self.get_logger().info("Spline trajectory planning connected.")
+
+        # Reused for the startup scene setup below and later, mid-sequence,
+        # for attaching/detaching the grasped cylinder (see
+        # _attach_grasped_object / _detach_grasped_object).
+        self._planning_scene_client = self.create_client(
+            ApplyPlanningScene, "/apply_planning_scene", callback_group=self._client_group)
+        self.get_logger().info("Waiting for /apply_planning_scene service...")
+        self._planning_scene_client.wait_for_service()
+
+        # ------------------------------------------------------------------
+        # Ground-truth model poses: read via the dynamic_pose/info ->
+        # TFMessage bridge (sim.launch.py), write via the set_pose ->
+        # SetEntityPose bridge. See _get_model_pose / _set_model_pose and
+        # sim.launch.py's world_pose_bridge / world_set_pose_bridge
+        # comments for how these were chosen and verified.
+        # ------------------------------------------------------------------
+        self._latest_world_poses = {}   # name (str) -> (x, y, z)
+        self.create_subscription(
+            TFMessage, f"/world/{GZ_WORLD_NAME}/dynamic_pose/info", self._world_pose_cb, 10,
+            callback_group=self._client_group)
+
+        self._set_pose_client = self.create_client(
+            SetEntityPose, f"/world/{GZ_WORLD_NAME}/set_pose", callback_group=self._client_group)
+        self.get_logger().info("Waiting for /world/.../set_pose service...")
+        self._set_pose_client.wait_for_service()
 
         # ------------------------------------------------------------------
         # Gripper command publisher (drives the gz-sim JointPositionController
@@ -210,11 +374,20 @@ class PickPlaceNode(Node):
         # Name of the Gazebo model currently held via kinematic attach, if any
         self._attached_model = None
 
+        # dynamic_pose/info is only published periodically, not retrieved
+        # on demand the way the old subprocess call was, so this node has
+        # to actually receive at least one message before it knows any
+        # model's pose — needed next, for the collision objects below.
+        # Same pre-spin reasoning as the rclpy.spin_until_future_complete
+        # calls elsewhere in this constructor: there is no running spin
+        # loop yet for this to nest inside of.
+        self._wait_for_initial_world_poses()
+
         # ------------------------------------------------------------------
-        # Planning scene: register the table so MoveIt actually plans around
-        # it instead of being unaware it exists.
+        # Planning scene: register the table, cube, and cylinder so MoveIt
+        # actually plans around them instead of being unaware they exist.
         # ------------------------------------------------------------------
-        self._add_table_collision_object()
+        self._add_scene_collision_objects()
 
         # ------------------------------------------------------------------
         # Subscriber
@@ -223,7 +396,8 @@ class PickPlaceNode(Node):
             PoseArray,
             "/detected_objects",
             self.objects_callback,
-            10
+            10,
+            callback_group=self._sequence_group,
         )
 
         self.is_executing = False
@@ -235,46 +409,151 @@ class PickPlaceNode(Node):
     # -----------------------------------------------------------------------
     # Planning scene setup
     # -----------------------------------------------------------------------
-    def _add_table_collision_object(self) -> None:
-        client = self.create_client(ApplyPlanningScene, "/apply_planning_scene")
-        self.get_logger().info("Waiting for /apply_planning_scene service...")
-        client.wait_for_service()
-
-        table = CollisionObject()
-        table.header.frame_id = ROBOT_BASE_FRAME
-        table.id = "table"
-        table.operation = CollisionObject.ADD
+    @staticmethod
+    def _box_collision_object(object_id: str, size, position) -> CollisionObject:
+        obj = CollisionObject()
+        obj.header.frame_id = ROBOT_BASE_FRAME
+        obj.id = object_id
+        obj.operation = CollisionObject.ADD
 
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
-        box.dimensions = list(TABLE_SIZE)
-        table.primitives.append(box)
+        box.dimensions = list(size)
+        obj.primitives.append(box)
 
-        box_pose = Pose()
-        box_pose.position.x, box_pose.position.y, box_pose.position.z = TABLE_POSE
-        box_pose.orientation.w = 1.0
-        table.primitive_poses.append(box_pose)
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = position
+        pose.orientation.w = 1.0
+        obj.primitive_poses.append(pose)
+        return obj
 
+    @staticmethod
+    def _cylinder_collision_object(object_id: str, radius: float, height: float, position) -> CollisionObject:
+        obj = CollisionObject()
+        obj.header.frame_id = ROBOT_BASE_FRAME
+        obj.id = object_id
+        obj.operation = CollisionObject.ADD
+
+        cylinder = SolidPrimitive()
+        cylinder.type = SolidPrimitive.CYLINDER
+        # SolidPrimitive.CYLINDER_HEIGHT == 0, SolidPrimitive.CYLINDER_RADIUS == 1
+        cylinder.dimensions = [height, radius]
+        obj.primitives.append(cylinder)
+
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = position
+        pose.orientation.w = 1.0  # SDF pose has no rotation, cylinder stands on its local Z same as here
+        obj.primitive_poses.append(pose)
+        return obj
+
+    def _add_scene_collision_objects(self) -> None:
         scene = PlanningScene()
         scene.is_diff = True
-        scene.world.collision_objects.append(table)
+        scene.world.collision_objects.append(
+            self._box_collision_object("table", TABLE_SIZE, TABLE_POSE))
+
+        cube_pose = self._get_model_pose(PLACE_TARGET_MODEL)
+        if cube_pose is not None:
+            scene.world.collision_objects.append(
+                self._box_collision_object(PLACE_TARGET_MODEL, CUBE_SIZE, cube_pose))
+        else:
+            self.get_logger().warn(
+                f"Could not read '{PLACE_TARGET_MODEL}' pose at startup; "
+                "it will not be registered as a collision object."
+            )
+
+        cylinder_pose = self._get_model_pose(GRASP_TARGET_MODEL)
+        if cylinder_pose is not None:
+            scene.world.collision_objects.append(
+                self._cylinder_collision_object(
+                    GRASP_TARGET_MODEL, CYLINDER_RADIUS, CYLINDER_HALF_LENGTH * 2, cylinder_pose))
+        else:
+            self.get_logger().warn(
+                f"Could not read '{GRASP_TARGET_MODEL}' pose at startup; "
+                "it will not be registered as a collision object."
+            )
 
         request = ApplyPlanningScene.Request()
         request.scene = scene
 
-        future = client.call_async(request)
+        # rclpy.spin_until_future_complete is fine here specifically because
+        # this runs from __init__, before executor.spin() in main() has
+        # started — there is no running spin loop yet for this call to
+        # nest inside of. Everywhere else in this node that waits on a
+        # future does so from within a running callback instead, where that
+        # would not be true; see _wait_for_future and the threading model
+        # comment at the top of this file.
+        future = self._planning_scene_client.call_async(request)
         rclpy.spin_until_future_complete(self, future)
         if future.result() is not None and future.result().success:
-            self.get_logger().info("Table added to the planning scene as a collision object.")
+            self.get_logger().info(
+                "Table, cube, and cylinder added to the planning scene as collision objects.")
         else:
-            self.get_logger().warn("Failed to add table to the planning scene.")
+            self.get_logger().warn("Failed to add scene collision objects.")
+
+    def _attach_grasped_object(self, object_id: str) -> None:
+        # Attaching an object MoveIt already knows about (by id) moves it
+        # from the world into the robot state; explicitly removing the
+        # world copy in the same diff avoids depending on every MoveIt
+        # version doing that move automatically, which is cheap insurance
+        # against the object silently existing in both places at once.
+        attached = AttachedCollisionObject()
+        attached.link_name = END_EFFECTOR
+        attached.object.id = object_id
+        attached.object.operation = CollisionObject.ADD
+        attached.touch_links = GRIPPER_TOUCH_LINKS
+
+        world_remove = CollisionObject()
+        world_remove.id = object_id
+        world_remove.header.frame_id = ROBOT_BASE_FRAME
+        world_remove.operation = CollisionObject.REMOVE
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.robot_state.is_diff = True
+        scene.robot_state.attached_collision_objects.append(attached)
+        scene.world.collision_objects.append(world_remove)
+        self._apply_planning_scene_diff(scene, f"attach {object_id} to {END_EFFECTOR}")
+
+    def _detach_grasped_object(self, object_id: str) -> None:
+        # Detach only; the object is not re-registered in the world. It was
+        # just released and physics takes over its resting pose from here,
+        # which this node has no way to know ahead of the next detection
+        # cycle. The arm's immediate retreat still has the PRE_GRASP_OFFSET
+        # margin for clearance.
+        detached = AttachedCollisionObject()
+        detached.link_name = END_EFFECTOR
+        detached.object.id = object_id
+        detached.object.operation = CollisionObject.REMOVE
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.robot_state.is_diff = True
+        scene.robot_state.attached_collision_objects.append(detached)
+        self._apply_planning_scene_diff(scene, f"detach {object_id} from {END_EFFECTOR}")
+
+    def _apply_planning_scene_diff(self, scene: PlanningScene, description: str) -> None:
+        # Called from within the running sequence (unlike
+        # _add_scene_collision_objects's startup call), so this uses
+        # _wait_for_future rather than rclpy.spin_until_future_complete —
+        # see the threading model comment at the top of this file.
+        request = ApplyPlanningScene.Request()
+        request.scene = scene
+        future = self._planning_scene_client.call_async(request)
+        result = self._wait_for_future(future)
+        if result is not None and result.success:
+            self.get_logger().info(f"Planning scene updated: {description}")
+        else:
+            self.get_logger().warn(f"Failed to update planning scene: {description}")
 
     # -----------------------------------------------------------------------
     # Callback
     # -----------------------------------------------------------------------
     
     def objects_callback(self, msg: PoseArray) -> None:
-        if self.is_executing or self._done or not msg.poses:
+        with self._state_lock:
+            busy_or_done = self.is_executing or self._done
+        if busy_or_done or not msg.poses:
             return
 
         cylinder_gt = self._get_model_pose(GRASP_TARGET_MODEL)
@@ -290,10 +569,27 @@ class PickPlaceNode(Node):
         # top surface, never its center, so the detected Z is biased high
         # by roughly the object's own half-height: enough to make the
         # gripper close above the cylinder's body instead of around it.
+        #
+        # msg.poses are in the camera's own optical frame (msg.header
+        # matches the source point cloud's header). Look the camera's
+        # transform into ROBOT_BASE_FRAME up once via tf2 rather than the
+        # hand-written axis remapping this used to do, so the camera mount
+        # pose only has to be correct in one place: sim.launch.py's
+        # camera_tf static transform publisher.
+        try:
+            camera_to_base = self.tf_buffer.lookup_transform(
+                ROBOT_BASE_FRAME, msg.header.frame_id, rclpy.time.Time()
+            )
+        except tf2_ros.TransformException as ex:
+            self.get_logger().warn(
+                f"Could not look up {msg.header.frame_id} -> {ROBOT_BASE_FRAME}: {ex}")
+            return
+
         best_dist = GRASP_MATCH_RADIUS
         seen = False
         for cam in msg.poses:
-            x, y, z = self._camera_pose_to_robot(cam)
+            base_pose = tf2_geometry_msgs.do_transform_pose(cam, camera_to_base)
+            x, y, z = base_pose.position.x, base_pose.position.y, base_pose.position.z
             dist = ((x - cylinder_gt[0]) ** 2
                     + (y - cylinder_gt[1]) ** 2
                     + (z - cylinder_gt[2]) ** 2) ** 0.5
@@ -314,34 +610,25 @@ class PickPlaceNode(Node):
         target_pose.position.z = cylinder_gt[2]
         target_pose.orientation = self._down_orientation()
 
-        # Run the actual sequence on a worker thread, not this callback.
-        # _move_to_pose blocks on action-result futures; if it ran here it
-        # would nest inside the very rclpy.spin(node) loop that has to
-        # dispatch those results, which is exactly the re-entrancy hazard
-        # _wait_for_future's docstring above describes. On a separate
-        # thread it can safely poll while spin(node) keeps running.
-        self.is_executing = True
-        threading.Thread(
-            target=self._run_pick_and_place, args=(target_pose,), daemon=True
-        ).start()
+        # Run the sequence directly on this callback's own executor thread
+        # (this callback belongs to _sequence_group, a
+        # MutuallyExclusiveCallbackGroup, so the MultiThreadedExecutor gives
+        # it a dedicated thread and will not dispatch a second concurrent
+        # invocation of it). _move_to_pose and friends still block on
+        # action/service futures, but that is safe here: the futures are
+        # completed by _client_group callbacks running on other executor
+        # threads, not by this one. See the threading model comment at the
+        # top of this file.
+        with self._state_lock:
+            self.is_executing = True
+        self._run_pick_and_place(target_pose)
 
     def _run_pick_and_place(self, target_pose: Pose) -> None:
         try:
             self._execute_pick_and_place(target_pose)
         finally:
-            self.is_executing = False
-
-    @staticmethod
-    def _camera_pose_to_robot(cam: Pose):
-        # Camera is mounted at world/base_link (CAMERA_X, 0, CAMERA_Z), pitched
-        # 90deg down, in the camera's optical frame convention (Z forward,
-        # X right, Y down). That maps: optical Z -> base +X, optical X ->
-        # base -Z, optical Y -> base +Y (unchanged, no flip).
-        return (
-            cam.position.z + CAMERA_X,
-            cam.position.y,
-            -cam.position.x + CAMERA_Z,
-        )
+            with self._state_lock:
+                self.is_executing = False
 
     @staticmethod
     def _down_orientation() -> Quaternion:
@@ -361,7 +648,8 @@ class PickPlaceNode(Node):
         place_pose = Pose()
         place_pose.position.x = place_xyz[0]
         place_pose.position.y = place_xyz[1]
-        place_pose.position.z = place_xyz[2] + CUBE_HALF_HEIGHT + CYLINDER_HALF_LENGTH + PLACE_CLEARANCE
+        place_pose.position.z = motion_math.compute_place_height(
+            place_xyz[2], CUBE_HALF_HEIGHT, CYLINDER_HALF_LENGTH, PLACE_CLEARANCE)
         place_pose.orientation = self._down_orientation()
 
         grasp_pose.orientation = self._down_orientation()
@@ -390,8 +678,10 @@ class PickPlaceNode(Node):
             self._send_gripper_command(GRIPPER_CLOSED)
 
             if self._verify_grasp(GRASP_TARGET_MODEL):
-                self._attached_model = GRASP_TARGET_MODEL
-                self.get_logger().info(f"Object grasped: {self._attached_model}")
+                with self._state_lock:
+                    self._attached_model = GRASP_TARGET_MODEL
+                self._attach_grasped_object(GRASP_TARGET_MODEL)
+                self.get_logger().info(f"Object grasped: {GRASP_TARGET_MODEL}")
                 grasped = True
                 break
 
@@ -426,68 +716,118 @@ class PickPlaceNode(Node):
 
         self.get_logger().info("Step 7/8 — Releasing onto the cube...")
         self._send_gripper_command(GRIPPER_OPEN)
-        self._attached_model = None
+        self._detach_grasped_object(GRASP_TARGET_MODEL)
+        with self._state_lock:
+            self._attached_model = None
 
         self.get_logger().info("Step 8/8 — Retreating and returning home...")
         self._move_linear(pre_place_pose)
         self._move_to_home()
 
-        self._done = True
-        self.get_logger().info("Pick-and-place complete: cylinder placed on the cube!")
+        with self._state_lock:
+            self._done = True
+
+        # Verify against the cached ground truth instead of assuming the
+        # sequence finishing means the cylinder actually landed correctly.
+        cylinder_final = self._get_model_pose(GRASP_TARGET_MODEL)
+        cube_final = self._get_model_pose(PLACE_TARGET_MODEL)
+        if cylinder_final is not None and cube_final is not None:
+            dx = abs(cylinder_final[0] - cube_final[0])
+            dy = abs(cylinder_final[1] - cube_final[1])
+            z = cylinder_final[2]
+            placed_correctly = (
+                dx <= PLACEMENT_POSE_TOLERANCE
+                and dy <= PLACEMENT_POSE_TOLERANCE
+                and z > cube_final[2] + CUBE_HALF_HEIGHT
+            )
+        else:
+            dx = dy = z = float("nan")
+            placed_correctly = False
+
+        if placed_correctly:
+            self.get_logger().info(
+                f"Placement verified: dx={dx:.4f} dy={dy:.4f} z={z:.4f}"
+            )
+            self.get_logger().info("Pick-and-place complete: cylinder placed on the cube!")
+        else:
+            self.get_logger().error(
+                f"Placement FAILED: dx={dx:.4f} dy={dy:.4f} z={z:.4f}"
+            )
 
     # -----------------------------------------------------------------------
     # Gripper control
     # -----------------------------------------------------------------------
     def _send_gripper_command(self, position: float) -> None:
         self._gripper_pub.publish(Float64(data=position))
-        # gz's JointPositionController drives the joint asynchronously with
-        # no completion feedback over this topic; give it time to get there.
-        time.sleep(GRIPPER_MOVE_TIME)
+        # The gz JointPositionController drives the joint asynchronously
+        # with no completion feedback over the /gripper_position_cmd topic
+        # itself, but its actual progress is observable: gripper.xacro adds
+        # a state-only ros2_control interface specifically so
+        # gripper_finger_joint is published on /joint_states (see its
+        # comment), which this node already subscribes to
+        # (_joint_state_cb). Poll that instead of sleeping a fixed amount
+        # regardless of whether the joint actually got there yet.
+        deadline = time.monotonic() + GRIPPER_WAIT_TIMEOUT
+        while time.monotonic() < deadline:
+            joint_state = self._latest_joint_state
+            if joint_state is not None and GRIPPER_JOINT_NAME in joint_state.name:
+                idx = joint_state.name.index(GRIPPER_JOINT_NAME)
+                if abs(joint_state.position[idx] - position) <= GRIPPER_POSITION_TOLERANCE:
+                    return
+            time.sleep(GRIPPER_WAIT_POLL_INTERVAL)
+        self.get_logger().warn(
+            f"Gripper did not reach {position:.4f} within {GRIPPER_WAIT_TIMEOUT}s; "
+            "continuing anyway."
+        )
 
     # -----------------------------------------------------------------------
     # Kinematic attach — the mock gripper does not grip objects through
     # contact physics, so while an object is "held" we teleport it in Gazebo
     # to track the gripper_tcp frame instead.
+    #
+    # Ground-truth model poses used to be read with "ign model -m <name> -p"
+    # and written with "ign service ... set_pose", both as a blocking
+    # subprocess shelling out to the ign CLI. Both are now plain ROS2
+    # topic/service calls instead, bridged in sim.launch.py (see its
+    # world_pose_bridge / world_set_pose_bridge comments for how this was
+    # found and verified against the real simulator before relying on it):
+    #   - read: gz-sim's dynamic_pose/info -> tf2_msgs/msg/TFMessage,
+    #     subscribed below and cached by name in _latest_world_poses.
+    #   - write: gz-sim's set_pose service -> ros_gz_interfaces/srv/
+    #     SetEntityPose, called through _set_pose_client.
     # -----------------------------------------------------------------------
-    def _get_model_pose(self, name: str):
-        # NOTE: this must be the "ign" CLI, not "gz" — in this Fortress-era
-        # install "gz model" can't find the running server at all ("An
-        # instance of Gazebo is not running"), while "ign model" is the one
-        # that actually talks to it.
-        try:
-            out = subprocess.run(
-                ["ign", "model", "-m", name, "-p"],
-                capture_output=True, text=True, timeout=3.0,
+    def _world_pose_cb(self, msg: TFMessage) -> None:
+        for t in msg.transforms:
+            translation = t.transform.translation
+            self._latest_world_poses[t.child_frame_id] = (
+                translation.x, translation.y, translation.z)
+
+    def _wait_for_initial_world_poses(self, timeout_sec: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline and not self._latest_world_poses:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        if not self._latest_world_poses:
+            self.get_logger().warn(
+                f"No model poses received within {timeout_sec}s of starting "
+                "to listen; the scene collision objects below may be skipped."
             )
-        except (subprocess.SubprocessError, OSError):
-            return None
-        lines = out.stdout.splitlines()
-        for i, line in enumerate(lines):
-            if "Pose [" in line and i + 1 < len(lines):
-                nums = lines[i + 1].strip().strip("[]").split()
-                if len(nums) >= 3:
-                    try:
-                        return tuple(float(n) for n in nums[:3])
-                    except ValueError:
-                        return None
-        return None
+
+    def _get_model_pose(self, name: str):
+        return self._latest_world_poses.get(name)
 
     def _set_model_pose(self, name: str, x: float, y: float, z: float) -> None:
-        # "ign model" has no pose-setting flags in this version, so this
-        # goes straight through gz-transport's world set_pose service
-        # instead (note the "ignition.msgs" namespace, not "gz.msgs").
-        req = f'name: "{name}", position: {{x: {x}, y: {y}, z: {z}}}'
-        try:
-            subprocess.run(
-                ["ign", "service", "-s", f"/world/{GZ_WORLD_NAME}/set_pose",
-                 "--reqtype", "ignition.msgs.Pose",
-                 "--reptype", "ignition.msgs.Boolean",
-                 "--timeout", "2000",
-                 "--req", req],
-                capture_output=True, text=True, timeout=3.0,
-            )
-        except (subprocess.SubprocessError, OSError):
-            pass
+        request = SetEntityPose.Request()
+        request.entity.name = name
+        request.entity.type = Entity.MODEL
+        request.pose.position.x = x
+        request.pose.position.y = y
+        request.pose.position.z = z
+        request.pose.orientation.w = 1.0   # identity; omitting this leaves
+                                            # an invalid all-zero quaternion
+        future = self._set_pose_client.call_async(request)
+        result = self._wait_for_future(future)
+        if result is None or not result.success:
+            self.get_logger().warn(f"set_pose for '{name}' did not report success.")
 
     def _verify_grasp(self, model_name: str) -> bool:
         # A grasp only counts if the object actually ended up between the
@@ -510,7 +850,9 @@ class PickPlaceNode(Node):
         return dist < GRASP_VERIFY_RADIUS
 
     def _sync_attached_model_pose(self) -> None:
-        if not self._attached_model:
+        with self._state_lock:
+            attached_model = self._attached_model
+        if not attached_model:
             return
         try:
             tf = self.tf_buffer.lookup_transform(
@@ -520,7 +862,7 @@ class PickPlaceNode(Node):
             self.get_logger().warn(f"Could not look up gripper_tcp in world frame: {ex}")
             return
         t = tf.transform.translation
-        self._set_model_pose(self._attached_model, t.x, t.y, t.z)
+        self._set_model_pose(attached_model, t.x, t.y, t.z)
 
     # -----------------------------------------------------------------------
     # Straight-line move for short local motions (descend/retreat) — see the
@@ -630,33 +972,80 @@ class PickPlaceNode(Node):
             return None
 
     @staticmethod
+    def _spline_duration(start: list, goal: list) -> float:
+        # See motion_math.spline_duration's docstring for the reasoning
+        # (velocity-derived first estimate, verified and if necessary
+        # lengthened against the spline's own sampled acceleration). Moved
+        # there, out of this ROS node class, specifically so it can be unit
+        # tested without ROS running (test/test_motion_math.py); this stays
+        # as a thin wrapper binding this node's actual velocity/accel/floor
+        # constants.
+        return motion_math.spline_duration(
+            start, goal, MAX_JOINT_VELOCITY, MAX_JOINT_ACCEL, MIN_SPLINE_DURATION)
+
+    @staticmethod
     def _build_spline_trajectory(start: list, goal: list) -> RobotTrajectory:
         # Per-joint cubic spline, clamped to zero velocity at both ends —
         # a single smooth accelerate/decelerate blend from start to goal,
         # instead of RRTConnect's piecewise-linear joint-space path.
-        splines = [
-            CubicSpline([0.0, SPLINE_DURATION], [s, g], bc_type=((1, 0.0), (1, 0.0)))
-            for s, g in zip(start, goal)
-        ]
+        # Duration is sized per move from this specific displacement (see
+        # _spline_duration) instead of a fixed constant, so a small move
+        # finishes quickly and a large one still respects the
+        # velocity/acceleration budget rather than silently exceeding it.
+        # The actual sampling is motion_math.build_spline_samples (pure,
+        # unit tested separately); this method's own job is just wrapping
+        # those samples into the ROS RobotTrajectory message type.
+        duration = PickPlaceNode._spline_duration(start, goal)
+        samples = motion_math.build_spline_samples(start, goal, duration, SPLINE_STEPS)
 
         trajectory = RobotTrajectory()
         trajectory.joint_trajectory.joint_names = list(ARM_JOINT_NAMES)
-        for i in range(SPLINE_STEPS + 1):
-            t = SPLINE_DURATION * i / SPLINE_STEPS
+        for t, positions, velocities, accelerations in samples:
             point = JointTrajectoryPoint()
-            point.positions = [float(s(t)) for s in splines]
-            point.velocities = [float(s(t, 1)) for s in splines]
-            point.accelerations = [float(s(t, 2)) for s in splines]
+            point.positions = positions
+            point.velocities = velocities
+            point.accelerations = accelerations
             point.time_from_start.sec = int(t)
             point.time_from_start.nanosec = int(round((t - int(t)) * 1e9))
             trajectory.joint_trajectory.points.append(point)
         return trajectory
 
-    def _trajectory_is_valid(self, trajectory: RobotTrajectory) -> bool:
+    @staticmethod
+    def _path_length(start: list, goal: list) -> float:
+        return motion_math.path_length(start, goal)
+
+    def _trajectory_is_valid(self, trajectory: RobotTrajectory, num_checks: int) -> bool:
         # Bypassing OMPL for spline moves also bypasses its collision
-        # checking, so check each waypoint against the planning scene
-        # (table included) before committing to executing it.
-        for point in trajectory.joint_trajectory.points:
+        # checking, so check waypoints against the planning scene (table,
+        # cube, cylinder included) before committing to executing it.
+        #
+        # num_checks is derived from the joint-space path length (see
+        # _move_spline_to_joints), not fixed, so a long move gets
+        # proportionally more checks than a short one instead of every move
+        # getting the same count regardless of how far it travels. Capped
+        # at however many points the built trajectory actually has
+        # (SPLINE_STEPS+1) — checking more distinct configurations than
+        # exist as discrete points would need re-sampling the spline
+        # itself, not done here.
+        #
+        # REMAINING LIMITATION: this only checks a finite number of
+        # discrete points along a continuous path. A thin obstacle that
+        # lies entirely between two consecutive checked points can still
+        # be missed. VALIDITY_CHECK_SPACING trades that risk against the
+        # number of /check_state_validity calls per move; it is not a
+        # guarantee of continuous collision checking the way OMPL's own
+        # checking is.
+        points = trajectory.joint_trajectory.points
+        if num_checks >= len(points):
+            indices = range(len(points))
+        else:
+            indices = sorted({
+                round(i * (len(points) - 1) / (num_checks - 1))
+                for i in range(num_checks)
+            })
+
+        for idx in indices:
+            point = points[idx]
             request = GetStateValidity.Request()
             request.group_name = PLANNING_GROUP
             request.robot_state.joint_state.name = list(ARM_JOINT_NAMES)
@@ -679,7 +1068,12 @@ class PickPlaceNode(Node):
             return None
 
         trajectory = self._build_spline_trajectory(start, goal)
-        if not self._trajectory_is_valid(trajectory):
+        path_length = self._path_length(start, goal)
+        num_checks = max(
+            MIN_VALIDITY_CHECKS,
+            math.ceil(path_length / VALIDITY_CHECK_SPACING) + 1,
+        )
+        if not self._trajectory_is_valid(trajectory, num_checks):
             self.get_logger().warn(
                 "Spline path would collide with the planning scene; "
                 "falling back to joint-space planning."
@@ -815,13 +1209,12 @@ class PickPlaceNode(Node):
         return self._send_goal(goal)
 
     # -----------------------------------------------------------------------
-    # Wait for a future without spinning — this is called from a worker
-    # thread (see _run_pick_and_place), never from inside a callback. The
-    # one real spin loop is rclpy.spin(node) in main(), running concurrently
-    # on the main thread; nesting rclpy.spin_until_future_complete() inside
-    # a callback that spin loop is already dispatching is a known rclpy
-    # re-entrancy hazard — the goal-acceptance future reliably resolves that
-    # way, but the action *result* future reliably never does.
+    # Wait for a future without calling into rclpy's own spin machinery.
+    # This runs on the _sequence_group executor thread, inside what is
+    # structurally a subscription callback (see the threading model comment
+    # at the top of this file). The future it waits on is completed by a
+    # _client_group callback on a different executor thread, so plain
+    # polling here is sufficient and avoids re-entering spin() altogether.
     # -----------------------------------------------------------------------
     @staticmethod
     def _wait_for_future(future):
@@ -863,8 +1256,31 @@ class PickPlaceNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = PickPlaceNode()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    # 8 threads: one is effectively reserved for the sequence callback
+    # (_sequence_group only ever runs one callback at a time regardless of
+    # how many threads are available), one is effectively reserved for
+    # /joint_states (_joint_state_group is otherwise empty), the rest
+    # service _client_group (action/service results) concurrently while the
+    # sequence is blocked. 4 threads was tried first and a test run against
+    # it failed with symptoms that looked like thread starvation, which is
+    # why this was raised to 8; a later clean rerun with nothing else
+    # competing for CPU found the real cause was an unrelated test script
+    # bug (orphaned Gazebo processes, see DECISIONS.md), not insufficient
+    # threads. 8 is kept as a reasonable defensive choice, not because 4
+    # was shown to be insufficient. This node is I/O-bound, not CPU-bound,
+    # almost every thread spends nearly all its time blocked on a future or
+    # a sleep, not computing, so more threads than this machine's 8 cores
+    # is still reasonable headroom, not wasted resources.
+    executor = MultiThreadedExecutor(num_threads=8)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

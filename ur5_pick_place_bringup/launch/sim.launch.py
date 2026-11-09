@@ -35,24 +35,44 @@ def generate_launch_description():
         'pick_place.sdf'
     ])
 
+    # --------------------------------------------------------------------------
+    # Camera mount pose: declared here, once, as this launch file's own
+    # arguments. This is the single source of truth for where the camera
+    # is — pick_place_node.py no longer hardcodes it (it looks the published
+    # TF transform up via tf2 instead, see objects_callback in
+    # pick_place_node.py). pick_place.sdf still has its own independent copy
+    # of these same numbers in the depth_camera model's <pose>, since gz-sim
+    # reads the world file directly and has no way to consume a ROS2 launch
+    # argument; that copy is commented there to say it must match these
+    # defaults.
+    # --------------------------------------------------------------------------
+    camera_x_arg = DeclareLaunchArgument('camera_x', default_value='0.65')
+    camera_y_arg = DeclareLaunchArgument('camera_y', default_value='0')
+    camera_z_arg = DeclareLaunchArgument('camera_z', default_value='1.3')
+    camera_roll_arg = DeclareLaunchArgument('camera_roll', default_value='0')
+    camera_pitch_arg = DeclareLaunchArgument('camera_pitch', default_value='1.5708')
+    camera_yaw_arg = DeclareLaunchArgument('camera_yaw', default_value='0')
+
     # Static transform: base_link -> depth_camera/link/depth_camera
-    # Camera is fixed at 0.65m forward, 1.3m up, pointing straight down —
-    # must match the depth_camera model's pose in pick_place.sdf exactly.
     # Parented to base_link (not base_link_inertia): base_link is coincident
     # with world (identity fixed joint in ur.urdf.xacro), matching the
     # camera's actual world-frame pose in pick_place.sdf.
     # base_link_inertia is base_link rotated 180deg about Z, which would
     # place this TF frame on the wrong side of the robot.
     camera_tf = Node(
-    package='tf2_ros',
-    executable='static_transform_publisher',
-    name='camera_tf_publisher',
-    arguments=[
-        '0.65', '0', '1.3',      # x y z translation
-        '0', '1.5708', '0',      # roll pitch yaw (pointing down)
-        'base_link',              # parent frame
-        'depth_camera/link/depth_camera'  # child frame
-    ]
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_tf_publisher',
+        arguments=[
+            LaunchConfiguration('camera_x'),
+            LaunchConfiguration('camera_y'),
+            LaunchConfiguration('camera_z'),
+            LaunchConfiguration('camera_roll'),
+            LaunchConfiguration('camera_pitch'),
+            LaunchConfiguration('camera_yaw'),
+            'base_link',                        # parent frame
+            'depth_camera/link/depth_camera',   # child frame
+        ]
     )
 
     # --------------------------------------------------------------------------
@@ -133,11 +153,64 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}]
     )
 
+    # --------------------------------------------------------------------------
+    # 5. ros_gz_bridge: ground-truth model poses, read + write, for
+    # pick_place_node.py. Replaces the "ign model -p" / "ign service
+    # set_pose" subprocess CLI calls that version used to shell out to.
+    #
+    # Read side: gz-sim's own dynamic_pose/info topic (ignition.msgs.Pose_V,
+    # one entry per non-static entity, keyed by bare entity name in
+    # child_frame_id, confirmed live: "ros2 topic echo
+    # /world/pick_place_world/dynamic_pose/info" showed child_frame_id:
+    # blue_cylinder / red_box with the expected spawn coordinates) bridges
+    # cleanly to tf2_msgs/msg/TFMessage; ros_gz_bridge has that conversion
+    # built in (confirmed in its compiled symbol table before relying on
+    # it: FactoryI<tf2_msgs::msg::TFMessage, ignition::msgs::Pose_V>).
+    #
+    # Write side: gz-sim's /world/<world>/set_pose service bridges cleanly
+    # to ros_gz_interfaces/srv/SetEntityPose (also confirmed in the
+    # compiled symbol table, then verified live: calling it on
+    # blue_cylinder and reading its pose back immediately after showed the
+    # teleport actually happened, including the object subsequently
+    # falling under gravity exactly as a real teleport-then-physics-steps
+    # would produce). No subprocess fallback was needed for either
+    # direction.
+    # --------------------------------------------------------------------------
+    world_pose_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='world_pose_bridge',
+        arguments=[
+            '/world/pick_place_world/dynamic_pose/info@tf2_msgs/msg/TFMessage[ignition.msgs.Pose_V'
+        ],
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
+
+    world_set_pose_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        name='world_set_pose_bridge',
+        arguments=[
+            '/world/pick_place_world/set_pose@ros_gz_interfaces/srv/SetEntityPose'
+        ],
+        output='screen',
+        parameters=[{'use_sim_time': True}]
+    )
+
     return LaunchDescription([
-        camera_tf,
         ur_type_arg,
+        camera_x_arg,
+        camera_y_arg,
+        camera_z_arg,
+        camera_roll_arg,
+        camera_pitch_arg,
+        camera_yaw_arg,
+        camera_tf,
         ur_sim_control,
         ur_moveit,
         camera_bridge,
         gripper_bridge,
+        world_pose_bridge,
+        world_set_pose_bridge,
     ])

@@ -26,8 +26,9 @@ def generate_launch_description():
             'cluster_tolerance': 0.02,
             'min_cluster_size': 50,
             'max_cluster_size': 25000,
-            'passthrough_min_z': 0.55,
-            'passthrough_max_z': 0.79,
+            'passthrough_min': 0.55,
+            'passthrough_max': 0.79,
+            'passthrough_axis': 'x',
             'plane_distance_threshold': 0.01,
             'voxel_leaf_size': 0.005,
         }]

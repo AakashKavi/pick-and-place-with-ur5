@@ -1,12 +1,11 @@
 #include "ur5_pick_place_perception/object_detector.hpp"
 
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/segmentation/extract_clusters.h>
-#include <pcl/kdtree/kdtree.h>
 #include <visualization_msgs/msg/marker.hpp>
 #include <std_msgs/msg/header.hpp>
 
@@ -20,18 +19,32 @@ ObjectDetectorNode::ObjectDetectorNode()
   this->declare_parameter("cluster_tolerance",      0.02);
   this->declare_parameter("min_cluster_size",        50);
   this->declare_parameter("max_cluster_size",      25000);
-  this->declare_parameter("passthrough_min_z",      0.55);
-  this->declare_parameter("passthrough_max_z",      0.79);
+  // passthrough_axis is "x" by default, not the z-axis its old name implied.
+  // The gz-sim depth_camera sensor used here publishes PointCloud2 with the
+  // optical-frame x field carrying depth (distance from the camera along its
+  // view direction), not the z field a ROS REP-103 optical frame would
+  // suggest. Confirmed empirically (see git history: "fix: correct
+  // passthrough filter axis to x for depth filtering") and by the numbers
+  // matching pick_place.sdf's camera-to-table-top distance (0.80 m) against
+  // these bounds. If this node is ever pointed at a different depth source
+  // that publishes a standard optical-frame cloud, this parameter is the
+  // one to change, not the filter logic.
+  this->declare_parameter("passthrough_min",        0.55);
+  this->declare_parameter("passthrough_max",        0.79);
+  this->declare_parameter("passthrough_axis",       std::string("x"));
   this->declare_parameter("voxel_leaf_size",        0.01);
   this->declare_parameter("plane_distance_threshold", 0.01);
+  this->declare_parameter("enable_plane_removal", false);
 
   cluster_tolerance_        = this->get_parameter("cluster_tolerance").as_double();
   min_cluster_size_         = this->get_parameter("min_cluster_size").as_int();
   max_cluster_size_         = this->get_parameter("max_cluster_size").as_int();
-  passthrough_min_z_        = this->get_parameter("passthrough_min_z").as_double();
-  passthrough_max_z_        = this->get_parameter("passthrough_max_z").as_double();
+  passthrough_min_          = this->get_parameter("passthrough_min").as_double();
+  passthrough_max_          = this->get_parameter("passthrough_max").as_double();
+  passthrough_axis_         = this->get_parameter("passthrough_axis").as_string();
   voxel_leaf_size_          = this->get_parameter("voxel_leaf_size").as_double();
   plane_distance_threshold_ = this->get_parameter("plane_distance_threshold").as_double();
+  enable_plane_removal_     = this->get_parameter("enable_plane_removal").as_bool();
 
   // Subscriber
   pointcloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -58,6 +71,16 @@ void ObjectDetectorNode::pointcloudCallback(
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
   pcl::fromROSMsg(*msg, *cloud);
 
+  // The gz-sim depth camera can publish NaN points (see README: known to
+  // happen in headless mode, not verified absent in GUI mode either), and
+  // every downstream PCL filter below assumes finite coordinates. Drop them
+  // here, once, rather than letting each stage guess whether its input is
+  // clean. A cloud that is all-NaN becomes genuinely empty after this and
+  // is caught by the empty check right below, same as a cloud with zero
+  // points to begin with.
+  std::vector<int> finite_indices;
+  pcl::removeNaNFromPointCloud(*cloud, *cloud, finite_indices);
+
   if (cloud->empty()) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "Received empty point cloud");
@@ -65,10 +88,18 @@ void ObjectDetectorNode::pointcloudCallback(
   }
 
   // --- Pipeline ---
+  // Plane removal is optional (enable_plane_removal, default false): the
+  // passthrough crop below already excludes the table surface for this
+  // specific camera/table geometry (table top is at 0.80 m depth from the
+  // camera, the crop's upper bound is 0.79 m), so RANSAC plane removal is
+  // redundant work here. It is kept available and wired in because that
+  // depth margin is scene-specific and will not hold for a different
+  // table height or camera mount.
   auto downsampled  = downsample(cloud);
   auto filtered     = passthroughFilter(downsampled);
-  //auto objects_only = removePlane(filtered);
-  auto clusters     = extractClusters(filtered);
+  auto objects_only = enable_plane_removal_ ? removePlane(filtered) : filtered;
+  auto clusters     = ur5_pick_place_perception::extractClusters(
+    objects_only, cluster_tolerance_, min_cluster_size_, max_cluster_size_);
 
   // Build PoseArray from cluster centroids
   geometry_msgs::msg::PoseArray pose_array;
@@ -109,14 +140,19 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr ObjectDetectorNode::downsample(
 //
 // We only care about the region directly above the table. Anything too close
 // to the camera or too far below is noise we can safely discard.
+//
+// passthrough_axis_ is the depth axis of the incoming cloud, not
+// necessarily the ROS REP-103 optical convention's z. For this node's gz-sim
+// depth_camera source it is "x" (see the passthrough_axis parameter comment
+// in the constructor).
 // ---------------------------------------------------------------------------
 pcl::PointCloud<pcl::PointXYZ>::Ptr ObjectDetectorNode::passthroughFilter(
   const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud)
 {
   pcl::PassThrough<pcl::PointXYZ> pass;
   pass.setInputCloud(cloud);
-  pass.setFilterFieldName("x");
-  pass.setFilterLimits(passthrough_min_z_, passthrough_max_z_);
+  pass.setFilterFieldName(passthrough_axis_);
+  pass.setFilterLimits(passthrough_min_, passthrough_max_);
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr out(new pcl::PointCloud<pcl::PointXYZ>);
   pass.filter(*out);
@@ -163,42 +199,13 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr ObjectDetectorNode::removePlane(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 4: Euclidean Cluster Extraction
-//
-// Points that are close together (within cluster_tolerance) get grouped into
-// one cluster — each cluster represents one object. This works like grouping
-// islands on a map: if two pieces of land are close enough, they belong to
-// the same island.
+// Stage 4: Euclidean Cluster Extraction — see
+// ur5_pick_place_perception::extractClusters in clustering.hpp/.cpp. Moved
+// there as a free function, parameterized explicitly instead of reading
+// cluster_tolerance_/min_cluster_size_/max_cluster_size_ off this node's
+// state, so it can be unit tested on a synthetic cloud without
+// constructing a full rclcpp node (test/test_clustering.cpp).
 // ---------------------------------------------------------------------------
-std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> ObjectDetectorNode::extractClusters(
-  const pcl::PointCloud<pcl::PointXYZ>::Ptr & cloud)
-{
-  std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> result;
-
-  if (cloud->empty()) return result;
-
-  pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
-  tree->setInputCloud(cloud);
-
-  std::vector<pcl::PointIndices> cluster_indices;
-  pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
-  ec.setClusterTolerance(cluster_tolerance_);
-  ec.setMinClusterSize(min_cluster_size_);
-  ec.setMaxClusterSize(max_cluster_size_);
-  ec.setSearchMethod(tree);
-  ec.setInputCloud(cloud);
-  ec.extract(cluster_indices);
-
-  for (const auto & indices : cluster_indices) {
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
-    for (int idx : indices.indices) {
-      cluster->push_back(cloud->points[idx]);
-    }
-    result.push_back(cluster);
-  }
-
-  return result;
-}
 
 // ---------------------------------------------------------------------------
 // Compute centroid of a cluster and return as a Pose
